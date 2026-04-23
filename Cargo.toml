@@ -1,0 +1,10 @@
+[package]
+name = "broker_gateway_service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+apca = "0.30"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+futures = "0.3"
+async-trait = "0.1"
