@@ -1,3 +1,6 @@
+use std::sync::{Arc, Mutex};
+
+
 #[derive(Default, Clone)]
 pub struct KillSwitch {
     enabled: Arc<Mutex<bool>>,

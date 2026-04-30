@@ -1,4 +1,6 @@
-// metrics_adapter.rs
+// adapters/metrics/metrics_adapter.rs
+
+use crate::core::ports::observability::IObservability;
 
 pub struct MetricsAdapter;
 

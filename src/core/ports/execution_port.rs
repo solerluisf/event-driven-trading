@@ -1,16 +1,13 @@
-// execution_port.rs
+// core/ports/execution_port.rs
+use async_trait::async_trait;
+use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId};
 
-pub trait IExecutionPort {
-    fn submit(&self, cmd: OrderCmd);
-    fn cancel(&self, cmd: CancelCmd);
-    fn replace(&self, cmd: ReplaceCmd);
-    fn status_query(&self, query: StatusQuery);
+#[async_trait]
+pub trait IExecutionPort: Send + Sync {
+    type Error: std::error::Error + Send + Sync;
+
+    async fn submit_order(&self, cmd: OrderCmd) -> Result<ExecutionId, Self::Error>;
+    async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), Self::Error>;
+    async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), Self::Error>;
+    async fn query_status(&self, query: StatusQuery) -> Result<(), Self::Error>;
 }
-
-impl IExecutionPort for GatewayService {
-    fn submit(&self, _cmd: OrderCmd) {}
-    fn cancel(&self, _cmd: CancelCmd) {}
-    fn replace(&self, _cmd: ReplaceCmd) {}
-    fn status_query(&self, _query: StatusQuery) {}
-}
-

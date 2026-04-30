@@ -1,4 +1,6 @@
-// health_endpoint.rs
+// adapters/metrics/health_endpoint.rs
+
+use crate::core::domain::request::Health;
 
 pub struct HealthEndpoint;
 

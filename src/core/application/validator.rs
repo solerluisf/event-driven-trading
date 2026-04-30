@@ -1,4 +1,7 @@
 // validator.rs
+use crate::core::domain::request::RequestEnvelope;
+use crate::core::domain::journal::ValidatedRequest;
+
 
 pub struct RequestValidator;
 

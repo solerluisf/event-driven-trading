@@ -1,7 +1,19 @@
 // connection_manager.rs
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
+use crate::core::domain::request::{Connection, BrokerId};
+
 
 pub struct ConnectionManager {
     pools: Mutex<HashMap<String, VecDeque<Connection>>>,
+}
+
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self {
+            pools: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl ConnectionManager {

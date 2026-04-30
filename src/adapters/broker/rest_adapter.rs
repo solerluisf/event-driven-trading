@@ -1,26 +1,36 @@
-// rest_adapter.rs
+// adapters/broker/rest_adapter.rs
+
+use async_trait::async_trait;
+use crate::core::ports::execution_port::IExecutionPort;
+use crate::core::domain::order::{
+    OrderCmd,
+    CancelCmd,
+    ReplaceCmd,
+    StatusQuery,
+    ExecutionId,
+};
+use crate::adapters::broker::broker_error::BrokerError;
 
 #[derive(Default)]
-pub struct RestBrokerAdapter {
-    pub cb: CircuitBreaker,
-}
+pub struct RestBrokerAdapter;
 
-impl IBrokerAdapter for RestBrokerAdapter {
-    fn connect(&self) -> Connection {
-        Connection {
-            conn_id: "rest-conn".into(),
-        }
+#[async_trait]
+impl IExecutionPort for RestBrokerAdapter {
+    type Error = BrokerError;
+
+    async fn submit_order(&self, _cmd: OrderCmd) -> Result<ExecutionId, Self::Error> {
+        todo!()
     }
 
-    fn disconnect(&self) {}
-
-    fn send(&self, req: RequestEnvelope) -> ResponseEnvelope {
-        let _ = req;
-        ResponseEnvelope {
-            correlation_id: "rest".into(),
-            ok: true,
-        }
+    async fn cancel_order(&self, _cmd: CancelCmd) -> Result<(), Self::Error> {
+        todo!()
     }
 
-    fn on_event(&self, _callback: Box<dyn Fn(String) + Send + Sync>) {}
+    async fn replace_order(&self, _cmd: ReplaceCmd) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    async fn query_status(&self, _query: StatusQuery) -> Result<(), Self::Error> {
+        todo!()
+    }
 }

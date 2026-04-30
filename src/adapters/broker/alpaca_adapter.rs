@@ -1,73 +1,126 @@
 // src/adapters/broker/alpaca_adapter.rs
-use super::broker_adapter::BrokerAdapterId;
-use apca::client::{Client, Config};
-use apca::data::v2::order::{Amount, CreateReqInit, Side, TimeInForce, Type};
-use apca::rest::order::Create;
-use core::ports::execution_port::{IExecutionPort, OrderSide, OrderType, TimeInForce, ExecutionId};
 
-#[derive(Clone)]
+use std::sync::Arc;
+use std::str::FromStr;
+use async_trait::async_trait;
+use num_decimal::Num;
+use uuid::Uuid;
+
+// apca imports
+use apca::Client;
+use apca::api::v2::order::{
+    Create,
+    CreateReqInit,
+    Delete,
+    Side,
+    Type,
+    TimeInForce as ApcaTimeInForce,
+    Amount,
+    Id as OrderId,
+};
+
+// domain types
+use crate::core::domain::order::{
+    OrderCmd,
+    CancelCmd,
+    ReplaceCmd,
+    StatusQuery,
+    ExecutionId,
+    OrderSide,
+    OrderType,
+    TimeInForce,
+};
+
+// port trait
+use crate::core::ports::execution_port::IExecutionPort;
+
+// unified error
+use crate::adapters::broker::broker_error::BrokerError;
+
 pub struct AlpacaBrokerAdapter {
-    adapter_id: BrokerAdapterId,
-    apca_client: Client,
+    client: Arc<Client>,
 }
 
 impl AlpacaBrokerAdapter {
-    pub fn new(config: Config, adapter_id: BrokerAdapterId) -> Result<Self, apca::Error> {
-        Ok(Self {
-            adapter_id,
-            apca_client: Client::new(config)?,
-        })
+    pub fn new(client: Client) -> Self {
+        Self {
+            client: Arc::new(client),
+        }
     }
 }
 
-// Convert your domain types into `apca`‑style enums/structs inline
-#[async_trait::async_trait]
+#[async_trait]
 impl IExecutionPort for AlpacaBrokerAdapter {
-    type Error = apca::Error;  // Or wrap into your own error type
+    type Error = BrokerError;
 
-    async fn execute_order(
-        &self,
-        symbol: String,
-        qty: u32,
-        side: OrderSide,
-        order_type: OrderType,
-        tif: TimeInForce,
-    ) -> Result<ExecutionId, Self::Error> {
-        let (apca_side, apca_type) = match (side, order_type) {
-            (OrderSide::Buy, OrderType::Market) => (Side::Buy, Type::Market),
-            (OrderSide::Sell, OrderType::Market) => (Side::Sell, Type::Market),
-            (OrderSide::Buy, OrderType::Limit) => (Side::Buy, Type::Limit),
-            (OrderSide::Sell, OrderType::Limit) => (Side::Sell, Type::Limit),
-            _ => unimplemented!(),
+    async fn submit_order(&self, cmd: OrderCmd) -> Result<ExecutionId, Self::Error> {
+        // map domain side → apca side
+        let side = match cmd.side {
+            OrderSide::Buy  => Side::Buy,
+            OrderSide::Sell => Side::Sell,
         };
 
-        let tif = match tif {
-            TimeInForce::Day => TimeInForce::Day,
-            TimeInForce::Gtc => TimeInForce::Gtc,
-            _ => TimeInForce::Day,
+        // map domain order type → apca type
+        let order_type = match cmd.order_type {
+            OrderType::Market    => Type::Market,
+            OrderType::Limit     => Type::Limit,
+            OrderType::Stop      => Type::Stop,
+            OrderType::StopLimit => Type::StopLimit,
         };
 
+        // map domain tif → apca tif
+        let tif = match cmd.time_in_force {
+            TimeInForce::Day => ApcaTimeInForce::Day,
+            TimeInForce::Gtc => ApcaTimeInForce::UntilCanceled,
+            TimeInForce::Ioc => ApcaTimeInForce::ImmediateOrCancel,
+            TimeInForce::Fok => ApcaTimeInForce::FillOrKill,
+        };
+
+        // map optional prices — convert f64 → Num via string
+        let limit_price = cmd.limit_price
+            .and_then(|p| Num::from_str(&p.to_string()).ok());
+        let stop_price = cmd.stop_price
+            .and_then(|p| Num::from_str(&p.to_string()).ok());
+
+        // build apca request — symbol, side, amount go into .init()
         let req = CreateReqInit {
-            account: None,
-            symbol,
-            qty: Some(qty),
-            notional: None,
-            side: apca_side,
-            r#type: apca_type,
+            type_: order_type,
             time_in_force: tif,
-            limit_price: None,  // fill this if your `OrderType::Limit` has a price
-            stop_price: None,
-            stop_loss: None,
-            take_profit: None,
-            client_order_id: None,
-            extended_hours: false,
-        };
+            limit_price,
+            stop_price,
+            ..Default::default()
+        }
+        .init(&cmd.symbol, side, Amount::quantity(cmd.qty));
 
-        let order = self
-            .apca_client
-            .issue::<Create>(&req.init())
-            .await?;
+        // send to apca and return execution id
+        let order = self.client
+            .issue::<Create>(&req)
+            .await
+            .map_err(|e| BrokerError::Unknown(format!("Failed to create order: {}", e)))?;
 
-        Ok(order.id.into()) // map `apca::order::Id` → `ExecutionId`
+        Ok(ExecutionId(order.id.to_string()))
+    }
+
+    async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), Self::Error> {
+        // Parse UUID string to create OrderId
+        let uuid = Uuid::parse_str(&cmd.execution_id.0)
+            .map_err(|_| BrokerError::InvalidOrderId(cmd.execution_id.0.clone()))?;
+        
+        let id = OrderId(uuid);
+
+        self.client
+            .issue::<Delete>(&id)
+            .await
+            .map_err(|e| BrokerError::Unknown(format!("Failed to delete order: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn replace_order(&self, _cmd: ReplaceCmd) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    async fn query_status(&self, _query: StatusQuery) -> Result<(), Self::Error> {
+        todo!()
     }
 }

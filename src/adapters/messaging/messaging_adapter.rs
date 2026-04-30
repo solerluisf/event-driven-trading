@@ -1,4 +1,6 @@
-// messaging_adapter.rs
+// adapters/messaging/messaging_adapter.rs
+
+use crate::core::ports::bus_adapter::BusAdapterTrait;
 
 pub struct MessagingAdapter;
 
