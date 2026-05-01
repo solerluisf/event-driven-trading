@@ -67,6 +67,7 @@ pub struct CancelCmd {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplaceCmd {
     pub execution_id: ExecutionId,
+    pub symbol: String,
     pub qty: Option<u32>,
     pub limit_price: Option<f64>,
 }

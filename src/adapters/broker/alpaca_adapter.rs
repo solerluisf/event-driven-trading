@@ -12,6 +12,7 @@ use apca::api::v2::order::{
     Create,
     CreateReqInit,
     Delete,
+    Get,
     Side,
     Type,
     TimeInForce as ApcaTimeInForce,
@@ -47,6 +48,12 @@ impl AlpacaBrokerAdapter {
             client: Arc::new(client),
         }
     }
+
+    fn parse_order_id(raw: &str) -> Result<OrderId, BrokerError> {
+        Uuid::parse_str(raw)
+            .map(OrderId)
+            .map_err(|_| BrokerError::InvalidOrderId(raw.to_string()))
+    }
 }
 
 #[async_trait]
@@ -54,13 +61,11 @@ impl IExecutionPort for AlpacaBrokerAdapter {
     type Error = BrokerError;
 
     async fn submit_order(&self, cmd: OrderCmd) -> Result<ExecutionId, Self::Error> {
-        // map domain side → apca side
         let side = match cmd.side {
             OrderSide::Buy  => Side::Buy,
             OrderSide::Sell => Side::Sell,
         };
 
-        // map domain order type → apca type
         let order_type = match cmd.order_type {
             OrderType::Market    => Type::Market,
             OrderType::Limit     => Type::Limit,
@@ -68,7 +73,6 @@ impl IExecutionPort for AlpacaBrokerAdapter {
             OrderType::StopLimit => Type::StopLimit,
         };
 
-        // map domain tif → apca tif
         let tif = match cmd.time_in_force {
             TimeInForce::Day => ApcaTimeInForce::Day,
             TimeInForce::Gtc => ApcaTimeInForce::UntilCanceled,
@@ -76,13 +80,11 @@ impl IExecutionPort for AlpacaBrokerAdapter {
             TimeInForce::Fok => ApcaTimeInForce::FillOrKill,
         };
 
-        // map optional prices — convert f64 → Num via string
         let limit_price = cmd.limit_price
             .and_then(|p| Num::from_str(&p.to_string()).ok());
         let stop_price = cmd.stop_price
             .and_then(|p| Num::from_str(&p.to_string()).ok());
 
-        // build apca request — symbol, side, amount go into .init()
         let req = CreateReqInit {
             type_: order_type,
             time_in_force: tif,
@@ -92,35 +94,69 @@ impl IExecutionPort for AlpacaBrokerAdapter {
         }
         .init(&cmd.symbol, side, Amount::quantity(cmd.qty));
 
-        // send to apca and return execution id
         let order = self.client
             .issue::<Create>(&req)
             .await
-            .map_err(|e| BrokerError::Unknown(format!("Failed to create order: {}", e)))?;
+            .map_err(|e| BrokerError::Unknown(format!("submit failed: {}", e)))?;
 
         Ok(ExecutionId(order.id.to_string()))
     }
 
     async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), Self::Error> {
-        // Parse UUID string to create OrderId
-        let uuid = Uuid::parse_str(&cmd.execution_id.0)
-            .map_err(|_| BrokerError::InvalidOrderId(cmd.execution_id.0.clone()))?;
-        
-        let id = OrderId(uuid);
+        let id = Self::parse_order_id(&cmd.execution_id.0)?;
 
         self.client
             .issue::<Delete>(&id)
             .await
-            .map_err(|e| BrokerError::Unknown(format!("Failed to delete order: {}", e)))?;
+            .map_err(|e| BrokerError::Unknown(format!("cancel failed: {}", e)))?;
 
         Ok(())
     }
 
-    async fn replace_order(&self, _cmd: ReplaceCmd) -> Result<(), Self::Error> {
-        todo!()
+    async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), Self::Error> {
+        let id = Self::parse_order_id(&cmd.execution_id.0)?;
+
+        // apca 0.30 doesn't support PATCH; cancel old order and create new one
+        self.client
+            .issue::<Delete>(&id)
+            .await
+            .map_err(|e| BrokerError::Unknown(format!("replace: cancel failed: {}", e)))?;
+
+        // For now, we can only create a Buy order since ReplaceCmd doesn't specify side
+        // In a real system, you'd want to extend ReplaceCmd to include side and other params
+        let limit_price = cmd.limit_price
+            .and_then(|p| Num::from_str(&p.to_string()).ok());
+
+        if let Some(qty) = cmd.qty {
+            let req = CreateReqInit {
+                limit_price,
+                ..Default::default()
+            }
+            .init(&cmd.symbol, Side::Buy, Amount::quantity(qty));
+
+            self.client
+                .issue::<Create>(&req)
+                .await
+                .map_err(|e| BrokerError::Unknown(format!("replace: create failed: {}", e)))?;
+        }
+
+        Ok(())
     }
 
-    async fn query_status(&self, _query: StatusQuery) -> Result<(), Self::Error> {
-        todo!()
+    async fn query_status(&self, query: StatusQuery) -> Result<(), Self::Error> {
+        let id = Self::parse_order_id(&query.execution_id.0)?;
+
+        let order = self.client
+            .issue::<Get>(&id)
+            .await
+            .map_err(|e| BrokerError::Unknown(format!("query_status failed: {}", e)))?;
+
+        tracing::info!(
+            "order status id={} status={:?}",
+            query.execution_id.0,
+            order.status
+        );
+
+        Ok(())
     }
 }

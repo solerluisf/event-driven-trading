@@ -1,9 +1,15 @@
 // core/application/gateway_service.rs
+//
+// GatewayService now holds its dependencies behind Arc<dyn Trait>
+// so they can be mocked in tests and swapped without recompiling.
 
 use std::sync::Arc;
-use crate::core::application::order_submission_service::OrderSubmissionService;
-use crate::core::application::risk_management_service::RiskManagementService;
-use crate::core::application::observability_service::ObservabilityService;
+
+use crate::core::ports::service_traits::{
+    IOrderSubmissionService,
+    IRiskManagementService,
+    IObservabilityService,
+};
 use crate::core::application::connection_manager::ConnectionManager;
 use crate::core::domain::execution_message::{ExecutionMessage, Message};
 use crate::core::domain::market_data::MarketSubscription;
@@ -13,17 +19,17 @@ use crate::core::ports::market_data_port::IMarketDataPort;
 use crate::adapters::broker::broker_error::BrokerError;
 
 pub struct GatewayService {
-    order_submission: OrderSubmissionService,
-    risk_management: RiskManagementService,
-    observability: ObservabilityService,
+    order_submission: Arc<dyn IOrderSubmissionService>,
+    risk_management:  Arc<dyn IRiskManagementService>,
+    observability:    Arc<dyn IObservabilityService>,
     connection_manager: ConnectionManager,
 }
 
 impl GatewayService {
     pub fn new(
-        order_submission: OrderSubmissionService,
-        risk_management: RiskManagementService,
-        observability: ObservabilityService,
+        order_submission: Arc<dyn IOrderSubmissionService>,
+        risk_management:  Arc<dyn IRiskManagementService>,
+        observability:    Arc<dyn IObservabilityService>,
         connection_manager: ConnectionManager,
     ) -> Self {
         Self {
@@ -35,19 +41,19 @@ impl GatewayService {
     }
 
     pub async fn submit_order(&self, cmd: OrderCmd) -> Result<ExecutionId, BrokerError> {
-        // step 1 — risk check before doing anything
+        // Risk check (kill switch + rate limit) before anything else
         self.risk_management.check(&cmd.symbol, 1)?;
 
-        // step 2 — record outbound intent
+        // Journal the outbound intent
         self.observability.record_outbound(RequestRecord {
             id: cmd.symbol.clone(),
-            raw_payload: None,
+            raw_payload: serde_json::to_string(&cmd).ok(),
         });
 
-        // step 3 — submit the order
+        // Submit
         let execution_id = self.order_submission.submit_order(cmd).await?;
 
-        // step 4 — record inbound result
+        // Journal the inbound confirmation
         self.observability.record_inbound(ResponseRecord {
             id: execution_id.0.clone(),
             raw_payload: None,
@@ -58,16 +64,23 @@ impl GatewayService {
 
     pub async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), BrokerError> {
         self.risk_management.check(&cmd.execution_id.0, 1)?;
+        self.observability.record_outbound(RequestRecord {
+            id: cmd.execution_id.0.clone(),
+            raw_payload: serde_json::to_string(&cmd).ok(),
+        });
         self.order_submission.cancel_order(cmd).await
     }
 
     pub async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), BrokerError> {
         self.risk_management.check(&cmd.execution_id.0, 1)?;
+        self.observability.record_outbound(RequestRecord {
+            id: cmd.execution_id.0.clone(),
+            raw_payload: serde_json::to_string(&cmd).ok(),
+        });
         self.order_submission.replace_order(cmd).await
     }
 
     pub async fn query_status(&self, query: StatusQuery) -> Result<(), BrokerError> {
-        self.risk_management.check(&query.execution_id.0, 1)?;
         self.order_submission.query_status(query).await
     }
 

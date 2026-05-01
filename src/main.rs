@@ -4,15 +4,19 @@ mod adapters;
 mod core;
 mod config;
 mod infra;
-mod app_tracing;
+mod app_tracing; // renamed from 'tracing' to avoid clash with the tracing crate
 
 use std::sync::Arc;
+use tracing::{info, error};
 
 use apca::Client;
 use apca::ApiInfo;
 
+use crate::config::app_config::AppConfig;
+
 use crate::adapters::broker::adapter_factory::AdapterFactory;
 use crate::adapters::messaging::bus_adapter::BusAdapter;
+use crate::adapters::messaging::market_data_publisher::MarketDataPublisher;
 use crate::adapters::metrics::metrics_adapter::MetricsAdapter;
 use crate::adapters::persistence::journal_storage::JournalStorage;
 
@@ -27,9 +31,18 @@ use crate::core::application::order_submission_service::OrderSubmissionService;
 use crate::core::application::rate_limiter::RateLimiterManager;
 use crate::core::application::risk_management_service::RiskManagementService;
 use crate::core::application::validator::RequestValidator;
+use crate::core::application::service_impls; // registers trait impls
 
 use crate::core::patterns::circuit_breaker::CircuitBreaker;
 use crate::core::patterns::telemetry_decorator::TelemetryDecorator;
+
+use crate::core::ports::observability::IObservability;
+use crate::core::ports::journal_repo::IJournalRepo;
+use crate::core::ports::service_traits::{
+    IOrderSubmissionService,
+    IRiskManagementService,
+    IObservabilityService,
+};
 
 #[tokio::main]
 async fn main() {
@@ -43,70 +56,90 @@ async fn main() {
         )
         .init();
 
+    // ── Config ────────────────────────────────────────────────────────────────
+    let cfg = AppConfig::from_env();
+    info!("config loaded: broker={} rep={} pub={}",
+        cfg.broker, cfg.zmq_rep_endpoint, cfg.zmq_pub_endpoint);
+
     // ── Shared infrastructure ─────────────────────────────────────────────────
     let metrics = Arc::new(MetricsAdapter);
     let journal = Arc::new(JournalStorage::new());
     let kill_switch = Arc::new(KillSwitch::default());
-    let rate_limiter = Arc::new(RateLimiterManager::default()); // 200 req/min
+    let rate_limiter = Arc::new(RateLimiterManager::new(cfg.rate_limit_rpm));
 
-    // ── Circuit breaker (per broker) ──────────────────────────────────────────
-    // threshold=3 failures, cooldown=30s
+    // ── Circuit breaker ───────────────────────────────────────────────────────
     let circuit_breaker = Arc::new(CircuitBreaker::new(
-        "alpaca",
-        3,
-        30,
-        Arc::clone(&metrics) as Arc<dyn crate::core::ports::observability::IObservability + Send + Sync>,
+        &cfg.broker,
+        cfg.cb_failure_threshold,
+        cfg.cb_cooldown_secs,
+        Arc::clone(&metrics) as Arc<dyn IObservability + Send + Sync>,
     ));
 
-    // ── Alpaca client ─────────────────────────────────────────────────────────
+    // ── Broker adapter ────────────────────────────────────────────────────────
     let api_info = ApiInfo::from_env()
-        .expect("missing env vars: APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL");
+        .expect("missing APCA_API_KEY_ID / APCA_API_SECRET_KEY / APCA_API_BASE_URL");
     let client = Client::new(api_info);
 
-    // ── Broker adapter ────────────────────────────────────────────────────────
     let factory = AdapterFactory::new(Some(client));
-    let config = BrokerConfig { name: "alpaca".into() };
-    let adapter = factory.create_adapter(config);
+    let adapter = factory.create_adapter(BrokerConfig { name: cfg.broker.clone() });
 
     // ── Application services ──────────────────────────────────────────────────
-    let order_submission = OrderSubmissionService::new(
+    let order_submission = Arc::new(OrderSubmissionService::new(
         RequestValidator,
         IdempotencyStore::default(),
         adapter,
         Arc::clone(&kill_switch),
         Arc::clone(&rate_limiter),
         Arc::clone(&circuit_breaker),
-        "alpaca",
-    );
+        &cfg.broker,
+    )) as Arc<dyn IOrderSubmissionService>;
 
-    let risk_management = RiskManagementService::new(
+    let risk_management = Arc::new(RiskManagementService::new(
         (*kill_switch).clone(),
-        RateLimiterManager::default(),
-    );
+        RateLimiterManager::new(cfg.rate_limit_rpm),
+    )) as Arc<dyn IRiskManagementService>;
 
-    let observability = ObservabilityService::new(
+    let observability = Arc::new(ObservabilityService::new(
         TelemetryDecorator,
-        Arc::clone(&metrics) as Arc<dyn crate::core::ports::observability::IObservability + Send + Sync>,
-        Arc::clone(&journal) as Arc<dyn crate::core::ports::journal_repo::IJournalRepo + Send + Sync>,
+        Arc::clone(&metrics) as Arc<dyn IObservability + Send + Sync>,
+        Arc::clone(&journal) as Arc<dyn IJournalRepo + Send + Sync>,
+    )) as Arc<dyn IObservabilityService>;
+
+    // ── Connection manager ────────────────────────────────────────────────────
+    let connection_manager = ConnectionManager::new(
+        cfg.reconnect_max_attempts,
+        cfg.reconnect_base_ms,
     );
 
+    // ── Gateway ───────────────────────────────────────────────────────────────
     let gateway = Arc::new(GatewayService::new(
         order_submission,
         risk_management,
         observability,
-        ConnectionManager::default(),
+        connection_manager,
     ));
 
+    // ── Market data PUB socket (actor-based) ──────────────────────────────────
+    let (publisher, publisher_handle) = MarketDataPublisher::spawn(&cfg.zmq_pub_endpoint);
+
     // ── ZeroMQ REP listener ───────────────────────────────────────────────────
-    let endpoint = std::env::var("GATEWAY_ZMQ_ENDPOINT")
-        .unwrap_or_else(|_| "tcp://127.0.0.1:5555".into());
+    let bus = BusAdapter::new(&cfg.zmq_rep_endpoint, Arc::clone(&gateway));
 
-    let bus = BusAdapter::new(endpoint, Arc::clone(&gateway));
+    info!("Broker Gateway Service started");
 
-    tracing::info!("Broker Gateway Service starting");
-
-    if let Err(e) = bus.listen().await {
-        tracing::error!("BusAdapter error: {}", e);
-        std::process::exit(1);
+    // Run both services concurrently; stop if either fails
+    tokio::select! {
+        result = bus.listen() => {
+            if let Err(e) = result {
+                error!("BusAdapter error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        result = publisher_handle => {
+            if let Err(e) = result {
+                error!("Publisher actor error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }

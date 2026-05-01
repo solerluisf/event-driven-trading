@@ -1,27 +1,28 @@
 // adapters/persistence/journal_storage.rs
 //
-// SQLite-backed append-only journal.
-// Two tables:
+// Redb-backed append-only event journal (pure Rust embedded database).
+// Uses separate tables for organization:
 //   outbound_commands    — every command sent to a broker
 //   inbound_confirmations — every response/event received from a broker
 //
-// Both rows carry:
-//   id          TEXT  — correlation / idempotency id
-//   occurred_at TEXT  — RFC-3339 UTC timestamp
-//   raw_payload TEXT  — full JSON payload
+// Key format: "timestamp:id" ensures chronological ordering.
+// Value: JSON-serialized payload for easy deserialization.
 //
-// The database file path is read from the JOURNAL_DB_PATH env var,
+// The database path is read from the JOURNAL_DB_PATH env var,
 // defaulting to "journal.db" in the working directory.
 
-use rusqlite::{Connection, params};
-use std::sync::Mutex;
+use redb::{Database, TableDefinition};
 use chrono::Utc;
 
 use crate::core::ports::journal_repo::IJournalRepo;
 use crate::core::domain::journal::{RequestRecord, ResponseRecord};
 
+// Table definitions
+const OUTBOUND_TABLE: TableDefinition<&str, &str> = TableDefinition::new("outbound_commands");
+const INBOUND_TABLE: TableDefinition<&str, &str> = TableDefinition::new("inbound_confirmations");
+
 pub struct JournalStorage {
-    conn: Mutex<Connection>,
+    db: Database,
 }
 
 impl JournalStorage {
@@ -29,37 +30,15 @@ impl JournalStorage {
         let path = std::env::var("JOURNAL_DB_PATH")
             .unwrap_or_else(|_| "journal.db".into());
 
-        let conn = Connection::open(&path)
-            .unwrap_or_else(|e| panic!("Failed to open journal DB at {}: {}", path, e));
+        let db = Database::create(&path)
+            .unwrap_or_else(|e| panic!("Failed to open Redb at {}: {}", path, e));
 
-        // Enable WAL mode for better concurrent write performance
-        conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .expect("Failed to set WAL mode");
+        tracing::info!("JournalStorage opened at {} with Redb", path);
 
-        // Create tables if they don't exist
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS outbound_commands (
-                id           TEXT NOT NULL,
-                occurred_at  TEXT NOT NULL,
-                raw_payload  TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS inbound_confirmations (
-                id           TEXT NOT NULL,
-                occurred_at  TEXT NOT NULL,
-                raw_payload  TEXT NOT NULL
-            );",
-        )
-        .expect("Failed to create journal tables");
-
-        tracing::info!("JournalStorage opened at {}", path);
-
-        Self {
-            conn: Mutex::new(conn),
-        }
+        Self { db }
     }
 }
 
-// Keep Default working for code that uses JournalStorage::default()
 impl Default for JournalStorage {
     fn default() -> Self {
         Self::new()
@@ -68,56 +47,125 @@ impl Default for JournalStorage {
 
 impl IJournalRepo for JournalStorage {
     fn persist_outbound(&self, record: RequestRecord) {
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now().timestamp_millis();
+        let key = format!("{}:{}", now, record.id);
         let payload = serde_json::to_string(&record)
             .unwrap_or_else(|_| format!(r#"{{"id":"{}"}}"#, record.id));
 
-        let conn = self.conn.lock().unwrap();
-        if let Err(e) = conn.execute(
-            "INSERT INTO outbound_commands (id, occurred_at, raw_payload) VALUES (?1, ?2, ?3)",
-            params![record.id, now, payload],
-        ) {
-            tracing::error!("journal persist_outbound failed: {}", e);
+        let write_txn = match self.db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                tracing::error!("journal persist_outbound transaction failed: {}", e);
+                return;
+            }
+        };
+
+        {
+            let mut table = match write_txn.open_table(OUTBOUND_TABLE) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("failed to open outbound_commands table: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = table.insert(key.as_str(), payload.as_str()) {
+                tracing::error!("journal persist_outbound insert failed: {}", e);
+                return;
+            }
+        }
+
+        if let Err(e) = write_txn.commit() {
+            tracing::error!("journal persist_outbound commit failed: {}", e);
+        } else {
+            tracing::debug!("persisted outbound command id={}", record.id);
         }
     }
 
     fn persist_inbound(&self, record: ResponseRecord) {
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now().timestamp_millis();
+        let key = format!("{}:{}", now, record.id);
         let payload = serde_json::to_string(&record)
             .unwrap_or_else(|_| format!(r#"{{"id":"{}"}}"#, record.id));
 
-        let conn = self.conn.lock().unwrap();
-        if let Err(e) = conn.execute(
-            "INSERT INTO inbound_confirmations (id, occurred_at, raw_payload) VALUES (?1, ?2, ?3)",
-            params![record.id, now, payload],
-        ) {
-            tracing::error!("journal persist_inbound failed: {}", e);
+        let write_txn = match self.db.begin_write() {
+            Ok(txn) => txn,
+            Err(e) => {
+                tracing::error!("journal persist_inbound transaction failed: {}", e);
+                return;
+            }
+        };
+
+        {
+            let mut table = match write_txn.open_table(INBOUND_TABLE) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!("failed to open inbound_confirmations table: {}", e);
+                    return;
+                }
+            };
+
+            if let Err(e) = table.insert(key.as_str(), payload.as_str()) {
+                tracing::error!("journal persist_inbound insert failed: {}", e);
+                return;
+            }
+        }
+
+        if let Err(e) = write_txn.commit() {
+            tracing::error!("journal persist_inbound commit failed: {}", e);
+        } else {
+            tracing::debug!("persisted inbound confirmation id={}", record.id);
         }
     }
 
     fn replay(&self, query: String) -> Vec<ResponseRecord> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare(
-            "SELECT id FROM inbound_confirmations WHERE id LIKE ?1 ORDER BY occurred_at ASC",
-        ) {
-            Ok(s) => s,
+        let read_txn = match self.db.begin_read() {
+            Ok(txn) => txn,
             Err(e) => {
-                tracing::error!("journal replay prepare failed: {}", e);
+                tracing::error!("journal replay transaction failed: {}", e);
                 return vec![];
             }
         };
 
-        let pattern = format!("%{}%", query);
-        let rows = stmt.query_map(params![pattern], |row| {
-            Ok(ResponseRecord { id: row.get(0)?, raw_payload: None }) 
-        });
-
-        match rows {
-            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        let table = match read_txn.open_table(INBOUND_TABLE) {
+            Ok(t) => t,
             Err(e) => {
-                tracing::error!("journal replay query failed: {}", e);
-                vec![]
+                tracing::error!("failed to open inbound_confirmations table: {}", e);
+                return vec![];
+            }
+        };
+
+        let mut results = vec![];
+
+        // Use a full range scan to iterate through all records
+        match table.range::<&str>("".."zzz") {
+            Ok(iter) => {
+                for entry in iter {
+                    match entry {
+                        Ok((_, value)) => {
+                            let payload_str = value.value();
+                            match serde_json::from_str::<ResponseRecord>(payload_str) {
+                                Ok(record) => {
+                                    if record.id.contains(&query) {
+                                        results.push(record);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("failed to deserialize response record: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to read table entry: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to iterate inbound table: {}", e);
             }
         }
+
+        results
     }
 }
