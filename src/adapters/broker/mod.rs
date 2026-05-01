@@ -6,3 +6,4 @@ pub mod rest_adapter;
 pub mod websocket_adapter;
 pub mod broker_error;
 pub mod adapter_factory;
+pub mod alpaca_stream;

@@ -30,10 +30,48 @@ impl JournalStorage {
         let path = std::env::var("JOURNAL_DB_PATH")
             .unwrap_or_else(|_| "journal.db".into());
 
-        let db = Database::create(&path)
-            .unwrap_or_else(|e| panic!("Failed to open Redb at {}: {}", path, e));
+        // Try to open or create the redb database
+        let db = match Database::create(&path) {
+            Ok(db) => {
+                tracing::info!("JournalStorage opened at {} with Redb", path);
+                db
+            }
+            Err(e) => {
+                // If the error is due to the file existing in an incompatible format,
+                // (e.g., old SQLite database), rename it and create a fresh redb database
+                tracing::warn!(
+                    "Failed to open Redb at {}: {}. Attempting migration...",
+                    path,
+                    e
+                );
 
-        tracing::info!("JournalStorage opened at {} with Redb", path);
+                // Rename the old incompatible database
+                let backup_path = format!("{}.backup", path);
+                match std::fs::rename(&path, &backup_path) {
+                    Ok(_) => {
+                        tracing::info!(
+                            "Renamed old journal database to {} for migration",
+                            backup_path
+                        );
+                    }
+                    Err(rename_err) => {
+                        tracing::warn!(
+                            "Failed to rename old database during migration: {}",
+                            rename_err
+                        );
+                    }
+                }
+
+                // Now create a fresh redb database
+                Database::create(&path)
+                    .unwrap_or_else(|e2| {
+                        panic!(
+                            "Failed to create new Redb at {}: {}",
+                            path, e2
+                        )
+                    })
+            }
+        };
 
         Self { db }
     }

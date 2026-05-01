@@ -13,6 +13,8 @@
 //   GATEWAY_RECONNECT_MAX      5                      max reconnect attempts
 //   GATEWAY_RECONNECT_BASE_MS  500                    initial back-off in ms
 //   JOURNAL_DB_PATH            journal.db
+//   MARKET_DATA_FEED           iex                    "iex", "sip", or "test"
+//   MARKET_DATA_SYMBOLS        AAPL,SPY               comma-separated list (or "*")
 
 use std::env;
 
@@ -36,6 +38,10 @@ pub struct AppConfig {
     pub reconnect_base_ms: u64,
     /// SQLite journal file path
     pub journal_db_path: String,
+    /// Alpaca market data feed: "iex", "sip", or "test"
+    pub market_data_feed: String,
+    /// Symbols to stream — use ["*"] for all (requires appropriate plan)
+    pub market_data_symbols: Vec<String>,
 }
 
 impl AppConfig {
@@ -51,6 +57,8 @@ impl AppConfig {
             reconnect_max_attempts: env_parse("GATEWAY_RECONNECT_MAX", 5),
             reconnect_base_ms: env_parse("GATEWAY_RECONNECT_BASE_MS", 500),
             journal_db_path: env_str("JOURNAL_DB_PATH", "journal.db"),
+            market_data_feed: env_str("MARKET_DATA_FEED", "iex"),
+            market_data_symbols: env_symbol_list("MARKET_DATA_SYMBOLS", &["AAPL", "SPY"]),
         }
     }
 }
@@ -69,5 +77,19 @@ where
             panic!("Invalid value for {}: {:?}", key, e)
         }),
         Err(_) => default,
+    }
+}
+
+/// Parse a comma-separated symbol list.  Falls back to `defaults` if the env
+/// var is absent.
+fn env_symbol_list(key: &str, defaults: &[&str]) -> Vec<String> {
+    match env::var(key) {
+        Ok(val) if !val.trim().is_empty() => {
+            val.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+        _ => defaults.iter().map(|s| s.to_string()).collect(),
     }
 }

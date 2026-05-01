@@ -15,6 +15,7 @@ use apca::ApiInfo;
 use crate::config::app_config::AppConfig;
 
 use crate::adapters::broker::adapter_factory::AdapterFactory;
+use crate::adapters::broker::alpaca_stream::{AlpacaStreamConfig, self as alpaca_stream};
 use crate::adapters::messaging::bus_adapter::BusAdapter;
 use crate::adapters::messaging::market_data_publisher::MarketDataPublisher;
 use crate::adapters::metrics::metrics_adapter::MetricsAdapter;
@@ -58,8 +59,14 @@ async fn main() {
 
     // ── Config ────────────────────────────────────────────────────────────────
     let cfg = AppConfig::from_env();
-    info!("config loaded: broker={} rep={} pub={}",
-        cfg.broker, cfg.zmq_rep_endpoint, cfg.zmq_pub_endpoint);
+    info!(
+        "config loaded: broker={} rep={} pub={} feed={} symbols={:?}",
+        cfg.broker,
+        cfg.zmq_rep_endpoint,
+        cfg.zmq_pub_endpoint,
+        cfg.market_data_feed,
+        cfg.market_data_symbols,
+    );
 
     // ── Shared infrastructure ─────────────────────────────────────────────────
     let metrics = Arc::new(MetricsAdapter);
@@ -105,29 +112,42 @@ async fn main() {
         Arc::clone(&journal) as Arc<dyn IJournalRepo + Send + Sync>,
     )) as Arc<dyn IObservabilityService>;
 
-    // ── Connection manager ────────────────────────────────────────────────────
-    let connection_manager = ConnectionManager::new(
+    // ── Connection managers ───────────────────────────────────────────────────
+    // GatewayService takes ownership of one instance (its existing API).
+    // The stream gets its own Arc<ConnectionManager> for reconnect_with_backoff.
+    let stream_connection_manager = Arc::new(ConnectionManager::new(
         cfg.reconnect_max_attempts,
         cfg.reconnect_base_ms,
-    );
+    ));
 
     // ── Gateway ───────────────────────────────────────────────────────────────
     let gateway = Arc::new(GatewayService::new(
         order_submission,
         risk_management,
         observability,
-        connection_manager,
+        ConnectionManager::new(cfg.reconnect_max_attempts, cfg.reconnect_base_ms),
     ));
 
-    // ── Market data PUB socket (actor-based) ──────────────────────────────────
+    // ── Market data PUB socket (actor) ────────────────────────────────────────
     let (publisher, publisher_handle) = MarketDataPublisher::spawn(&cfg.zmq_pub_endpoint);
+
+    // ── Alpaca market data stream ─────────────────────────────────────────────
+    let stream_config = AlpacaStreamConfig::from_env(
+        cfg.market_data_feed.clone(),
+        cfg.market_data_symbols.clone(),
+    );
+    let stream_handle = alpaca_stream::spawn(
+        stream_config,
+        publisher.clone(),
+        Arc::clone(&stream_connection_manager),
+    );
 
     // ── ZeroMQ REP listener ───────────────────────────────────────────────────
     let bus = BusAdapter::new(&cfg.zmq_rep_endpoint, Arc::clone(&gateway));
 
     info!("Broker Gateway Service started");
 
-    // Run both services concurrently; stop if either fails
+    // Run all three concurrently; stop if any fails
     tokio::select! {
         result = bus.listen() => {
             if let Err(e) = result {
@@ -140,6 +160,10 @@ async fn main() {
                 error!("Publisher actor error: {}", e);
                 std::process::exit(1);
             }
+        }
+        _ = stream_handle => {
+            error!("Market data stream task exited unexpectedly");
+            std::process::exit(1);
         }
     }
 }

@@ -8,6 +8,8 @@ default-run = "broker_gateway_service"  # ← add this
 apca = "0.30"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
 futures = "0.3"
+futures-util = "0.3"                                          # ← add
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }  # ← add
 async-trait = "0.1"
 dotenvy = "0.15"
 num-decimal = { version = "0.2.5", features = ["num-v04"], default-features = false }
