@@ -408,3 +408,12 @@ fn normalize_bar(frame: &Value) -> Option<MarketDataEvent> {
         payload,
     })
 }
+
+/// Test-only re-export of the private `handle_message` function.
+#[cfg(test)]
+pub async fn handle_message_test(
+    text: &str,
+    publisher: &crate::adapters::messaging::market_data_publisher::MarketDataPublisher,
+) -> Result<(), String> {
+    handle_message(text, publisher).await
+}

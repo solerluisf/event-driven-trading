@@ -87,6 +87,13 @@ impl MarketDataPublisher {
         self.tx.send(event).await?;
         Ok(())
     }
+
+    /// For testing only — construct a publisher from an existing sender
+    /// so tests can intercept events without needing a ZMQ context.
+    #[cfg(test)]
+    pub fn from_sender(tx: tokio::sync::mpsc::Sender<MarketDataEvent>) -> Self {
+        Self { tx }
+    }
 }
 
 /// Actor task that manages the ZMQ socket and processes publish events
