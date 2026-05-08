@@ -18,6 +18,9 @@ use crate::core::application::gateway_service::GatewayService;
 use crate::core::domain::wire_message::{
     GatewayRequest, GatewayResponse, ResponsePayload, ErrorPayload,
 };
+use super::wire_codec::{
+    decode_gateway_request, encode_gateway_response, WireFormat,
+};
 
 pub struct BusAdapter {
     /// ZeroMQ endpoint string, e.g. "tcp://127.0.0.1:5555"
@@ -63,20 +66,25 @@ impl BusAdapter {
             };
 
             // Deserialize
-            let response: GatewayResponse = match serde_json::from_slice(&msg) {
+            let response: GatewayResponse = match decode_gateway_request(&msg) {
                 Err(e) => {
                     tracing::warn!("Failed to deserialize request: {}", e);
                     GatewayResponse::Err(ErrorPayload {
                         correlation_id: None,
                         code: "DESERIALIZE_ERROR".into(),
-                        message: e.to_string(),
+                        message: e,
                     })
                 }
-                Ok(req) => self.dispatch(req).await,
+                Ok((req, wire_format)) => {
+                    if wire_format == WireFormat::Json {
+                        tracing::debug!("Received legacy JSON request; consider upgrading client to MessagePack");
+                    }
+                    self.dispatch(req).await
+                }
             };
 
             // Serialize
-            let reply_bytes = serde_json::to_vec(&response).unwrap_or_else(|e| {
+            let reply_bytes = encode_gateway_response(&response).unwrap_or_else(|e| {
                 format!(r#"{{"status":"err","payload":{{"code":"SERIALIZE_ERROR","message":"{}"}}}}"#, e)
                     .into_bytes()
             });
@@ -93,6 +101,47 @@ impl BusAdapter {
                 tracing::warn!("Failed to send response: {}", e);
             }
         }
+    }
+
+    /// Bind the REP socket, process exactly one request, then return.
+    /// Useful for integration tests that need deterministic teardown.
+    pub async fn listen_once(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = Context::new();
+        let socket = Arc::new(Mutex::new(ctx.socket(zmq::REP)?));
+        socket.lock().unwrap().bind(&self.endpoint)?;
+
+        let socket_clone = socket.clone();
+        let dispatch_result = tokio::task::spawn_blocking(move || {
+            let socket = socket_clone.lock().unwrap();
+            socket.recv_bytes(0)
+        })
+        .await?;
+
+        let msg = dispatch_result?;
+
+        let response: GatewayResponse = match decode_gateway_request(&msg) {
+            Err(e) => GatewayResponse::Err(ErrorPayload {
+                correlation_id: None,
+                code: "DESERIALIZE_ERROR".into(),
+                message: e,
+            }),
+            Ok((req, _)) => self.dispatch(req).await,
+        };
+
+        let reply_bytes = encode_gateway_response(&response).unwrap_or_else(|e| {
+            format!(r#"{{"status":"err","payload":{{"code":"SERIALIZE_ERROR","message":"{}"}}}}"#, e)
+                .into_bytes()
+        });
+
+        let socket_clone = socket.clone();
+        let send_result = tokio::task::spawn_blocking(move || {
+            let socket = socket_clone.lock().unwrap();
+            socket.send(&reply_bytes, 0)
+        })
+        .await?;
+
+        send_result?;
+        Ok(())
     }
 
     /// Route a deserialized request to the correct GatewayService method.

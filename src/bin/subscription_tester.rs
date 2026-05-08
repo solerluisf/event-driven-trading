@@ -11,12 +11,14 @@
 //   GATEWAY_ZMQ_ENDPOINT  (default: tcp://127.0.0.1:5555)
 
 use zmq::Context;
-use serde_json;
 use std::sync::{Arc, Mutex};
 
 // We import the shared wire types directly from the library crate.
 use broker_gateway_service::core::domain::wire_message::{
     GatewayRequest, GatewayResponse,
+};
+use broker_gateway_service::adapters::messaging::wire_codec::{
+    decode_gateway_response, encode_gateway_request,
 };
 use broker_gateway_service::core::domain::market_data::MarketSubscription;
 
@@ -77,7 +79,7 @@ async fn send_and_recv(
     socket: &Arc<Mutex<zmq::Socket>>,
     req: &GatewayRequest,
 ) -> GatewayResponse {
-    let bytes = serde_json::to_vec(req).expect("serialize failed");
+    let bytes = encode_gateway_request(req).expect("serialize failed");
 
     // Send in blocking context
     let socket_clone = socket.clone();
@@ -97,8 +99,8 @@ async fn send_and_recv(
     .await
     .expect("recv task failed");
 
-    let response: GatewayResponse =
-        serde_json::from_slice(&response_bytes).expect("deserialize response failed");
+    let (response, _) =
+        decode_gateway_response(&response_bytes).expect("deserialize response failed");
 
     response
 }

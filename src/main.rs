@@ -18,6 +18,9 @@ use crate::adapters::broker::adapter_factory::AdapterFactory;
 use crate::adapters::broker::alpaca_stream::{AlpacaStreamConfig, self as alpaca_stream};
 use crate::adapters::messaging::bus_adapter::BusAdapter;
 use crate::adapters::messaging::market_data_publisher::{MarketDataEvent, MarketDataPublisher};
+use crate::adapters::messaging::wire_codec::{
+    strict_msgpack_decode_enabled, wire_codec_metrics_snapshot,
+};
 use crate::adapters::metrics::metrics_adapter::MetricsAdapter;
 use crate::adapters::persistence::journal_storage::JournalStorage;
 use crate::core::application::event_reactor::EventReactor;
@@ -69,6 +72,11 @@ async fn main() {
         cfg.zmq_pub_endpoint,
         cfg.market_data_feed,
         cfg.market_data_symbols,
+    );
+    info!(
+        "wire codec mode: encode=messagepack decode_fallback_json={} strict_decode={}",
+        !strict_msgpack_decode_enabled(),
+        strict_msgpack_decode_enabled()
     );
 
     // ── Shared infrastructure ─────────────────────────────────────────────────
@@ -163,6 +171,14 @@ async fn main() {
     let bus = BusAdapter::new(&cfg.zmq_rep_endpoint, Arc::clone(&gateway));
 
     info!("Broker Gateway Service started");
+    let initial_wire_metrics = wire_codec_metrics_snapshot();
+    info!(
+        "wire codec counters initialized: decode_msgpack_total={} decode_json_total={} decode_error_total={} encode_error_total={}",
+        initial_wire_metrics.decode_msgpack_total,
+        initial_wire_metrics.decode_json_total,
+        initial_wire_metrics.decode_error_total,
+        initial_wire_metrics.encode_error_total
+    );
 
     // Run all three concurrently; stop if any fails
     tokio::select! {

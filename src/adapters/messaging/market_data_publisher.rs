@@ -9,11 +9,13 @@
 //   Gateway (PUB, this file)  ──►  Market Data Service (SUB)
 //
 // Topic format: "market_data.<symbol>" e.g. "market_data.AAPL"
-// Payload: JSON-serialized MarketDataEvent
+// Payload: MessagePack-serialized MarketDataEvent (with JSON decode fallback
+// in consumers via wire_codec)
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use zmq::Socket;
+
+use crate::adapters::messaging::wire_codec::encode_market_data_event;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketDataEvent {
@@ -106,7 +108,18 @@ async fn publisher_actor(endpoint: String, mut rx: mpsc::Receiver<MarketDataEven
 
     while let Some(event) = rx.recv().await {
         let topic = format!("market_data.{}", event.symbol);
-        let payload = serde_json::to_vec(&event).unwrap_or_default();
+        let payload = match encode_market_data_event(&event) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to encode market_data event symbol={} type={:?}: {}",
+                    event.symbol,
+                    event.event_type,
+                    err
+                );
+                continue;
+            }
+        };
 
         // Send topic frame
         socket.send(&topic, zmq::SNDMORE)?;

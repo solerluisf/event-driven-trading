@@ -8,6 +8,10 @@
 
 
 
+use broker_gateway_service::adapters::messaging::wire_codec::{
+    decode_market_data_event, WireFormat,
+};
+
 fn main() {
     let ctx = zmq::Context::new();
     let socket = ctx.socket(zmq::SUB).expect("failed to create SUB socket");
@@ -29,15 +33,14 @@ fn main() {
             .expect("recv error")
             .unwrap_or_default();
 
-        // Frame 2: JSON payload
-        let payload = socket.recv_string(0)
-            .expect("recv error")
-            .unwrap_or_default();
+        // Frame 2: MessagePack payload (with JSON fallback)
+        let payload = socket.recv_bytes(0).expect("recv error");
 
-        // Pretty-print it
-        let pretty = serde_json::from_str::<serde_json::Value>(&payload)
-            .map(|v| serde_json::to_string_pretty(&v).unwrap_or(payload.clone()))
-            .unwrap_or(payload);
+        let pretty = match decode_market_data_event(&payload) {
+            Ok((event, WireFormat::MessagePack)) => format!("{:#?}", event),
+            Ok((event, WireFormat::Json)) => format!("{:#?}  [legacy-json]", event),
+            Err(e) => format!("failed to decode payload: {}", e),
+        };
 
         println!("── {} ──────────────────────────────", topic);
         println!("{}\n", pretty);
