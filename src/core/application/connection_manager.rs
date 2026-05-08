@@ -19,8 +19,9 @@ use tokio::time::sleep;
 use crate::core::domain::request::{Connection, BrokerId};
 
 pub struct ConnectionManager {
-    /// broker_id → active connection (simplified; one connection per broker)
-    connections: Mutex<HashMap<String, Connection>>,
+    /// broker_id → pool of active connections (supports multiple concurrent
+    /// connections to the same broker).
+    connections: Mutex<HashMap<String, HashMap<String, Connection>>>,
     max_attempts: u32,
     base_ms: u64,
 }
@@ -41,24 +42,63 @@ impl ConnectionManager {
     }
 
     /// Return an existing connection for the broker, if one exists.
+    ///
+    /// Note: with pooling, there can be multiple. This returns an arbitrary
+    /// one (use `get_connections` if you need all).
     pub fn get_connection(&self, broker_id: BrokerId) -> Option<Connection> {
+        let lock = self.connections.lock().ok()?;
+        let pool = lock.get(&broker_id.0)?;
+        pool.values().next().cloned()
+    }
+
+    /// Return all active connections for a given broker.
+    pub fn get_connections(&self, broker_id: BrokerId) -> Vec<Connection> {
         self.connections
             .lock()
             .ok()
             .and_then(|conns| conns.get(&broker_id.0).cloned())
+            .map(|pool| pool.into_values().collect())
+            .unwrap_or_default()
+    }
+
+    /// Return active connection count for a given broker.
+    pub fn connection_count(&self, broker_id: BrokerId) -> usize {
+        self.connections
+            .lock()
+            .ok()
+            .and_then(|conns| conns.get(&broker_id.0).map(|pool| pool.len()))
+            .unwrap_or(0)
     }
 
     /// Store a connection for a broker.
+    ///
+    /// If a connection with the same `conn_id` already exists, it is replaced.
     pub fn register_connection(&self, broker_id: BrokerId, conn: Connection) {
         if let Ok(mut conns) = self.connections.lock() {
-            conns.insert(broker_id.0, conn);
+            conns.entry(broker_id.0)
+                .or_default()
+                .insert(conn.conn_id.clone(), conn);
         }
     }
 
     /// Release (remove) a connection.
+    ///
+    /// This removes all connections for the broker.
     pub fn release_connection(&self, broker_id: &str) {
         if let Ok(mut conns) = self.connections.lock() {
             conns.remove(broker_id);
+        }
+    }
+
+    /// Release (remove) a single connection by ids.
+    pub fn release_connection_by_id(&self, broker_id: &str, conn_id: &str) {
+        if let Ok(mut conns) = self.connections.lock() {
+            if let Some(pool) = conns.get_mut(broker_id) {
+                pool.remove(conn_id);
+                if pool.is_empty() {
+                    conns.remove(broker_id);
+                }
+            }
         }
     }
 
@@ -123,5 +163,126 @@ impl ConnectionManager {
             broker_id
         );
         Err(last_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::domain::request::{Connection, BrokerId};
+
+    #[test]
+    fn can_register_multiple_connections_for_same_broker() {
+        let mgr = ConnectionManager::new(5, 500);
+        let broker = BrokerId("alpaca".to_string());
+
+        mgr.register_connection(
+            broker.clone(),
+            Connection {
+                conn_id: "alpaca-1".to_string(),
+            },
+        );
+        mgr.register_connection(
+            broker.clone(),
+            Connection {
+                conn_id: "alpaca-2".to_string(),
+            },
+        );
+
+        assert_eq!(mgr.connection_count(broker), 2);
+    }
+
+    #[test]
+    fn register_connection_replaces_same_conn_id() {
+        let mgr = ConnectionManager::new(5, 500);
+        let broker = BrokerId("alpaca".to_string());
+
+        mgr.register_connection(
+            broker.clone(),
+            Connection {
+                conn_id: "alpaca-1".to_string(),
+            },
+        );
+        mgr.register_connection(
+            broker,
+            Connection {
+                conn_id: "alpaca-1".to_string(),
+            },
+        );
+
+        assert_eq!(mgr.connection_count(BrokerId("alpaca".to_string())), 1);
+    }
+
+    #[test]
+    fn get_connections_returns_all_for_broker() {
+        let mgr = ConnectionManager::new(5, 500);
+        let broker = BrokerId("alpaca".to_string());
+
+        mgr.register_connection(
+            broker.clone(),
+            Connection {
+                conn_id: "alpaca-1".to_string(),
+            },
+        );
+        mgr.register_connection(
+            broker.clone(),
+            Connection {
+                conn_id: "alpaca-2".to_string(),
+            },
+        );
+
+        let mut ids: Vec<_> = mgr
+            .get_connections(broker)
+            .into_iter()
+            .map(|c| c.conn_id)
+            .collect();
+        ids.sort();
+
+        assert_eq!(ids, vec!["alpaca-1".to_string(), "alpaca-2".to_string()]);
+    }
+
+    #[test]
+    fn release_connection_by_id_removes_single_connection() {
+        let mgr = ConnectionManager::new(5, 500);
+        let broker = "alpaca";
+
+        mgr.register_connection(
+            BrokerId(broker.to_string()),
+            Connection {
+                conn_id: "alpaca-1".to_string(),
+            },
+        );
+        mgr.register_connection(
+            BrokerId(broker.to_string()),
+            Connection {
+                conn_id: "alpaca-2".to_string(),
+            },
+        );
+
+        mgr.release_connection_by_id(broker, "alpaca-1");
+
+        assert_eq!(mgr.connection_count(BrokerId(broker.to_string())), 1);
+
+        let conns = mgr.get_connections(BrokerId(broker.to_string()));
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].conn_id, "alpaca-2".to_string());
+    }
+
+    #[test]
+    fn release_connection_by_id_cleans_up_empty_broker_bucket() {
+        let mgr = ConnectionManager::new(5, 500);
+        let broker = "alpaca";
+
+        mgr.register_connection(
+            BrokerId(broker.to_string()),
+            Connection {
+                conn_id: "alpaca-1".to_string(),
+            },
+        );
+
+        mgr.release_connection_by_id(broker, "alpaca-1");
+
+        assert_eq!(mgr.connection_count(BrokerId(broker.to_string())), 0);
+        assert!(mgr.get_connections(BrokerId(broker.to_string())).is_empty());
     }
 }

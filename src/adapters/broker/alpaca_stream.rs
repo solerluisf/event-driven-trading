@@ -20,6 +20,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -110,6 +111,9 @@ async fn stream_loop(
     mut stream_command_rx: Receiver<MarketDataCommand>,
 ) {
     let broker_id = "alpaca_stream";
+    // Stable per stream task, so ConnectionManager can track multiple
+    // concurrent WS connections to the same broker.
+    let stream_conn_id = format!("{}-{}", broker_id, Uuid::new_v4());
 
     loop {
         let cfg = config.clone();
@@ -118,6 +122,7 @@ async fn stream_loop(
         let result = connection_manager
             .reconnect_with_backoff(broker_id, || {
                 let cfg = cfg.clone();
+                let stream_conn_id = stream_conn_id.clone();
                 async move {
                     let url = format!(
                         "wss://stream.data.alpaca.markets/v2/{}",
@@ -130,7 +135,9 @@ async fn stream_loop(
                             // We return a nominal Connection value; the real
                             // WS stream is managed inside run_stream below.
                             let _ = ws; // dropped — we reconnect inside run_stream
-                            Connection { conn_id: broker_id.to_string() }
+                            Connection {
+                                conn_id: stream_conn_id,
+                            }
                         })
                         .map_err(|e| format!("WS connect failed: {}", e))
                 }
