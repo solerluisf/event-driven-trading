@@ -165,6 +165,7 @@ async fn main() {
         reactor_tx.clone(),
         Arc::clone(&stream_connection_manager),
         stream_command_rx,
+        Arc::clone(&observability),
     );
 
     // ── ZeroMQ REP listener ───────────────────────────────────────────────────

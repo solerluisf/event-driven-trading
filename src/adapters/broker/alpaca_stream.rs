@@ -26,6 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{interval, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::adapters::messaging::market_data_publisher::{
@@ -34,6 +35,7 @@ use crate::adapters::messaging::market_data_publisher::{
 use crate::core::application::connection_manager::ConnectionManager;
 use crate::core::domain::market_data::MarketDataCommand;
 use crate::core::domain::request::Connection;
+use crate::core::ports::service_traits::IObservabilityService;
 
 // ── Raw wire types (Alpaca JSON) ──────────────────────────────────────────────
 
@@ -97,8 +99,9 @@ pub fn spawn(
     reactor_tx: Sender<MarketDataEvent>,
     connection_manager: Arc<ConnectionManager>,
     stream_command_rx: Receiver<MarketDataCommand>,
+    observability: Arc<dyn IObservabilityService>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(stream_loop(config, publisher, reactor_tx, connection_manager, stream_command_rx))
+    tokio::spawn(stream_loop(config, publisher, reactor_tx, connection_manager, stream_command_rx, observability))
 }
 
 // ── Stream loop ───────────────────────────────────────────────────────────────
@@ -109,6 +112,7 @@ async fn stream_loop(
     reactor_tx: Sender<MarketDataEvent>,
     connection_manager: Arc<ConnectionManager>,
     mut stream_command_rx: Receiver<MarketDataCommand>,
+    observability: Arc<dyn IObservabilityService>,
 ) {
     let broker_id = "alpaca_stream";
     // Stable per stream task, so ConnectionManager can track multiple
@@ -154,7 +158,7 @@ async fn stream_loop(
         // Actually run the stream. We reconnect the WS ourselves here rather
         // than inside the closure above, so we can hold the ws split across
         // the whole session.
-        match run_stream(&config, pub_clone, &reactor_tx, &mut stream_command_rx).await {
+        match run_stream(&config, pub_clone, &reactor_tx, &mut stream_command_rx, &observability).await {
             Ok(()) => {
                 tracing::info!("alpaca_stream: stream ended cleanly, reconnecting");
             }
@@ -171,6 +175,7 @@ async fn run_stream(
     publisher: MarketDataPublisher,
     reactor_tx: &Sender<MarketDataEvent>,
     stream_command_rx: &mut Receiver<MarketDataCommand>,
+    observability: &Arc<dyn IObservabilityService>,
 ) -> Result<(), String> {
     let url = format!(
         "wss://stream.data.alpaca.markets/v2/{}",
@@ -211,6 +216,12 @@ async fn run_stream(
         tracing::info!("alpaca_stream: started with no initial market data subscriptions");
     }
 
+    // ── Heartbeat and watchdog setup ──────────────────────────────────────────
+    let mut heartbeat = interval(Duration::from_secs(30)); // Send ping every 30s
+    let mut watchdog = interval(Duration::from_secs(10)); // Check every 10s
+    let mut last_message_time = Instant::now();
+    let mut last_event_time = Instant::now();
+
     // ── Message loop ──────────────────────────────────────────────────────────
     loop {
         tokio::select! {
@@ -228,11 +239,13 @@ async fn run_stream(
             msg_result = read.next() => {
                 match msg_result {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_message(&text, &publisher, Some(reactor_tx)).await {
+                        last_message_time = Instant::now();
+                        if let Err(e) = handle_message(&text, &publisher, Some(reactor_tx), observability, &mut last_event_time).await {
                             tracing::warn!("alpaca_stream: message handling error: {}", e);
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
+                        last_message_time = Instant::now();
                         // Respond to server pings to keep the connection alive
                         if let Err(e) = write.send(Message::Pong(data)).await {
                             return Err(format!("pong failed: {}", e));
@@ -250,6 +263,21 @@ async fn run_stream(
                         tracing::info!("alpaca_stream: websocket stream ended");
                         return Ok(());
                     }
+                }
+            }
+            _ = heartbeat.tick() => {
+                // Send a ping to keep the connection alive
+                if let Err(e) = write.send(Message::Ping(vec![])).await {
+                    return Err(format!("heartbeat ping failed: {}", e));
+                }
+                tracing::debug!("alpaca_stream: sent heartbeat ping");
+            }
+            _ = watchdog.tick() => {
+                let now = Instant::now();
+                let silent_duration = now.duration_since(last_message_time);
+                if silent_duration > Duration::from_secs(60) {
+                    observability.emit_event(format!("alpaca_stream: silent disconnect detected ({}s since last message)", silent_duration.as_secs()));
+                    return Err(format!("silent disconnect: no messages for {}s", silent_duration.as_secs()));
                 }
             }
         }
@@ -354,6 +382,8 @@ async fn handle_message(
     text: &str,
     publisher: &MarketDataPublisher,
     reactor_tx: Option<&Sender<MarketDataEvent>>,
+    observability: &Arc<dyn IObservabilityService>,
+    last_event_time: &mut Instant,
 ) -> Result<(), String> {
     let frames: Vec<Value> = serde_json::from_str(text)
         .map_err(|e| format!("JSON parse error: {} — raw: {}", e, text))?;
@@ -368,6 +398,13 @@ async fn handle_message(
             "t" => {
                 // Trade
                 if let Some(event) = normalize_trade(&frame) {
+                    let now = Instant::now();
+                    let gap = now.duration_since(*last_event_time);
+                    if gap > Duration::from_secs(10) {
+                        observability.emit_event(format!("alpaca_stream: market data gap detected: {}s since last event", gap.as_secs()));
+                    }
+                    *last_event_time = now;
+
                     if let Err(e) = publisher.publish(event.clone()).await {
                         tracing::warn!("alpaca_stream: publish failed: {}", e);
                     }
@@ -381,6 +418,13 @@ async fn handle_message(
             "q" => {
                 // Quote
                 if let Some(event) = normalize_quote(&frame) {
+                    let now = Instant::now();
+                    let gap = now.duration_since(*last_event_time);
+                    if gap > Duration::from_secs(10) {
+                        observability.emit_event(format!("alpaca_stream: market data gap detected: {}s since last event", gap.as_secs()));
+                    }
+                    *last_event_time = now;
+
                     if let Err(e) = publisher.publish(event.clone()).await {
                         tracing::warn!("alpaca_stream: publish failed: {}", e);
                     }
@@ -394,6 +438,13 @@ async fn handle_message(
             "b" => {
                 // Bar
                 if let Some(event) = normalize_bar(&frame) {
+                    let now = Instant::now();
+                    let gap = now.duration_since(*last_event_time);
+                    if gap > Duration::from_secs(10) {
+                        observability.emit_event(format!("alpaca_stream: market data gap detected: {}s since last event", gap.as_secs()));
+                    }
+                    *last_event_time = now;
+
                     if let Err(e) = publisher.publish(event.clone()).await {
                         tracing::warn!("alpaca_stream: publish failed: {}", e);
                     }
@@ -511,5 +562,19 @@ pub async fn handle_message_test(
     text: &str,
     publisher: &crate::adapters::messaging::market_data_publisher::MarketDataPublisher,
 ) -> Result<(), String> {
-    handle_message(text, publisher, None).await
+    use std::sync::Arc;
+    use tokio::time::Instant;
+    use crate::core::ports::service_traits::IObservabilityService;
+    use crate::core::domain::journal::{RequestRecord, ResponseRecord};
+
+    struct NoopObs;
+    impl IObservabilityService for NoopObs {
+        fn record_outbound(&self, _record: RequestRecord) {}
+        fn record_inbound(&self, _record: ResponseRecord) {}
+        fn emit_event(&self, _event: String) {}
+    }
+
+    let obs: Arc<dyn IObservabilityService> = Arc::new(NoopObs);
+    let mut last_event_time = Instant::now();
+    handle_message(text, publisher, None, &obs, &mut last_event_time).await
 }
