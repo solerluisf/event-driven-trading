@@ -5,6 +5,7 @@
 // unwraps every GatewayResponse on the other side.
 
 use serde::{Deserialize, Serialize};
+use crate::core::domain::market_data::MarketSubscription;
 use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery};
 
 // ── Inbound (Execution Service → Gateway) ────────────────────────────────────
@@ -16,6 +17,10 @@ pub enum GatewayRequest {
     CancelOrder(CancelCmd),
     ReplaceOrder(ReplaceCmd),
     QueryStatus(StatusQuery),
+    #[serde(rename = "subscribe")]
+    Subscribe(MarketSubscription),
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe(MarketSubscription),
 }
 
 // ── Outbound (Gateway → Execution Service) ───────────────────────────────────

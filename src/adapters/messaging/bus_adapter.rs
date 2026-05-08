@@ -157,6 +157,36 @@ impl BusAdapter {
                     }),
                 }
             }
+
+            GatewayRequest::Subscribe(sub) => {
+                let correlation_id = Some(sub.symbol.clone());
+                match self.gateway.subscribe(sub).await {
+                    Ok(()) => GatewayResponse::Ok(ResponsePayload {
+                        correlation_id,
+                        result: "subscribed".into(),
+                    }),
+                    Err(e) => GatewayResponse::Err(ErrorPayload {
+                        correlation_id,
+                        code: "SUBSCRIBE_FAILED".into(),
+                        message: e.to_string(),
+                    }),
+                }
+            }
+
+            GatewayRequest::Unsubscribe(sub) => {
+                let correlation_id = Some(sub.symbol.clone());
+                match self.gateway.unsubscribe(sub).await {
+                    Ok(()) => GatewayResponse::Ok(ResponsePayload {
+                        correlation_id,
+                        result: "unsubscribed".into(),
+                    }),
+                    Err(e) => GatewayResponse::Err(ErrorPayload {
+                        correlation_id,
+                        code: "UNSUBSCRIBE_FAILED".into(),
+                        message: e.to_string(),
+                    }),
+                }
+            }
         }
     }
 }

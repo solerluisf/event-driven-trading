@@ -18,17 +18,20 @@
 //   {"T":"q", "S":"AAPL", "bp":162.90, "ap":162.93, "t":"..."} <- quote
 //   {"T":"b", "S":"AAPL", "o":162.0, "h":163.0, "l":161.5, "c":162.5, "v":4900, "t":"..."} <- bar
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc::Receiver;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::adapters::messaging::market_data_publisher::{
     MarketDataEvent, MarketDataEventType, MarketDataPublisher,
 };
 use crate::core::application::connection_manager::ConnectionManager;
+use crate::core::domain::market_data::MarketDataCommand;
 use crate::core::domain::request::Connection;
 
 // ── Raw wire types (Alpaca JSON) ──────────────────────────────────────────────
@@ -91,8 +94,9 @@ pub fn spawn(
     config: AlpacaStreamConfig,
     publisher: MarketDataPublisher,
     connection_manager: Arc<ConnectionManager>,
+    stream_command_rx: Receiver<MarketDataCommand>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(stream_loop(config, publisher, connection_manager))
+    tokio::spawn(stream_loop(config, publisher, connection_manager, stream_command_rx))
 }
 
 // ── Stream loop ───────────────────────────────────────────────────────────────
@@ -101,6 +105,7 @@ async fn stream_loop(
     config: AlpacaStreamConfig,
     publisher: MarketDataPublisher,
     connection_manager: Arc<ConnectionManager>,
+    mut stream_command_rx: Receiver<MarketDataCommand>,
 ) {
     let broker_id = "alpaca_stream";
 
@@ -140,7 +145,7 @@ async fn stream_loop(
         // Actually run the stream. We reconnect the WS ourselves here rather
         // than inside the closure above, so we can hold the ws split across
         // the whole session.
-        match run_stream(&config, pub_clone).await {
+        match run_stream(&config, pub_clone, &mut stream_command_rx).await {
             Ok(()) => {
                 tracing::info!("alpaca_stream: stream ended cleanly, reconnecting");
             }
@@ -155,6 +160,7 @@ async fn stream_loop(
 async fn run_stream(
     config: &AlpacaStreamConfig,
     publisher: MarketDataPublisher,
+    stream_command_rx: &mut Receiver<MarketDataCommand>,
 ) -> Result<(), String> {
     let url = format!(
         "wss://stream.data.alpaca.markets/v2/{}",
@@ -181,50 +187,112 @@ async fn run_stream(
     // Wait for authenticated confirmation before subscribing
     wait_for_auth(&mut read).await?;
 
-    // ── Subscription ──────────────────────────────────────────────────────────
-    let subscribe_msg = json!({
-        "action": "subscribe",
-        "trades": config.symbols,
-        "quotes": config.symbols,
-        "bars":   config.symbols,
-    });
-    write
-        .send(Message::Text(subscribe_msg.to_string()))
-        .await
-        .map_err(|e| format!("subscribe send failed: {}", e))?;
-
-    tracing::info!(
-        "alpaca_stream: subscribed to symbols={:?} feed={}",
-        config.symbols,
-        config.feed
-    );
+    // ── Initial subscription ──────────────────────────────────────────────────
+    let mut subscribed_symbols: HashSet<String> = config.symbols.iter().cloned().collect();
+    if !subscribed_symbols.is_empty() {
+        let symbols: Vec<String> = subscribed_symbols.iter().cloned().collect();
+        send_subscription(&mut write, "subscribe", &symbols).await?;
+        tracing::info!(
+            "alpaca_stream: subscribed to symbols={:?} feed={}",
+            subscribed_symbols,
+            config.feed
+        );
+    } else {
+        tracing::info!("alpaca_stream: started with no initial market data subscriptions");
+    }
 
     // ── Message loop ──────────────────────────────────────────────────────────
-    while let Some(msg_result) = read.next().await {
-        match msg_result {
-            Ok(Message::Text(text)) => {
-                if let Err(e) = handle_message(&text, &publisher).await {
-                    tracing::warn!("alpaca_stream: message handling error: {}", e);
+    loop {
+        tokio::select! {
+            command = stream_command_rx.recv() => {
+                match command {
+                    Some(cmd) => {
+                        handle_stream_command(&mut write, &mut subscribed_symbols, cmd).await?;
+                    }
+                    None => {
+                        tracing::info!("alpaca_stream: stream command channel closed");
+                        return Ok(());
+                    }
                 }
             }
-            Ok(Message::Ping(data)) => {
-                // Respond to server pings to keep the connection alive
-                if let Err(e) = write.send(Message::Pong(data)).await {
-                    return Err(format!("pong failed: {}", e));
+            msg_result = read.next() => {
+                match msg_result {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Err(e) = handle_message(&text, &publisher).await {
+                            tracing::warn!("alpaca_stream: message handling error: {}", e);
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        // Respond to server pings to keep the connection alive
+                        if let Err(e) = write.send(Message::Pong(data)).await {
+                            return Err(format!("pong failed: {}", e));
+                        }
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        tracing::info!("alpaca_stream: server closed connection: {:?}", frame);
+                        return Ok(());
+                    }
+                    Some(Ok(_)) => {} // Binary or other frames — ignore
+                    Some(Err(e)) => {
+                        return Err(format!("stream read error: {}", e));
+                    }
+                    None => {
+                        tracing::info!("alpaca_stream: websocket stream ended");
+                        return Ok(());
+                    }
                 }
-            }
-            Ok(Message::Close(frame)) => {
-                tracing::info!("alpaca_stream: server closed connection: {:?}", frame);
-                return Ok(());
-            }
-            Ok(_) => {} // Binary or other frames — ignore
-            Err(e) => {
-                return Err(format!("stream read error: {}", e));
             }
         }
     }
 
-    Ok(())
+    // unreachable
+}
+
+async fn handle_stream_command<W>(
+    write: &mut W,
+    subscribed_symbols: &mut HashSet<String>,
+    command: MarketDataCommand,
+) -> Result<(), String>
+where
+    W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    match command {
+        MarketDataCommand::Subscribe(subscription) => {
+            let symbol = subscription.symbol.clone();
+            subscribed_symbols.insert(symbol.clone());
+            send_subscription(write, "subscribe", &[symbol]).await
+        }
+        MarketDataCommand::Unsubscribe(subscription) => {
+            let symbol = subscription.symbol.clone();
+            subscribed_symbols.remove(&symbol);
+            send_subscription(write, "unsubscribe", &[symbol]).await
+        }
+    }
+}
+
+async fn send_subscription<W>(
+    write: &mut W,
+    action: &str,
+    symbols: &[String],
+) -> Result<(), String>
+where
+    W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    if symbols.is_empty() {
+        return Ok(());
+    }
+
+    let subscribe_msg = json!({
+        "action": action,
+        "trades": symbols,
+        "quotes": symbols,
+        "bars": symbols,
+    });
+
+    write
+        .send(Message::Text(subscribe_msg.to_string()))
+        .await
+        .map_err(|e| format!("{} send failed: {}", action, e))
 }
 
 /// Wait for the `{"T":"success","msg":"authenticated"}` frame.

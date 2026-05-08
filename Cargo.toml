@@ -26,3 +26,7 @@ chrono   = { version = "0.4", features = ["serde"] }
 [[bin]]
 name = "mock_sender"
 path = "src/bin/mock_sender.rs"
+
+[[bin]]
+name = "subscription_tester"
+path = "src/bin/subscription_tester.rs"

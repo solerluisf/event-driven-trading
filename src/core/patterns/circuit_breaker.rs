@@ -129,7 +129,8 @@ impl CircuitBreaker {
         self.observability.emit(msg.clone());
 
         if g.failures >= g.failure_threshold || g.state == State::HalfOpen {
-            let until = Instant::now() + g.cooldown;
+            let cooldown = g.cooldown.max(Duration::from_millis(1));
+            let until = Instant::now() + cooldown;
             g.state = State::Open { until };
             let open_msg = format!(
                 "circuit_breaker.opened broker={} cooldown_secs={}",

@@ -12,17 +12,19 @@ use crate::core::ports::service_traits::{
 };
 use crate::core::application::connection_manager::ConnectionManager;
 use crate::core::domain::execution_message::{ExecutionMessage, Message};
-use crate::core::domain::market_data::MarketSubscription;
+use crate::core::domain::market_data::{MarketSubscription, MarketDataCommand};
 use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId};
 use crate::core::domain::journal::{RequestRecord, ResponseRecord};
 use crate::core::ports::market_data_port::IMarketDataPort;
 use crate::adapters::broker::broker_error::BrokerError;
+use tokio::sync::mpsc::Sender;
 
 pub struct GatewayService {
     order_submission: Arc<dyn IOrderSubmissionService>,
     risk_management:  Arc<dyn IRiskManagementService>,
     observability:    Arc<dyn IObservabilityService>,
     connection_manager: ConnectionManager,
+    stream_command_tx: Sender<MarketDataCommand>,
 }
 
 impl GatewayService {
@@ -31,12 +33,14 @@ impl GatewayService {
         risk_management:  Arc<dyn IRiskManagementService>,
         observability:    Arc<dyn IObservabilityService>,
         connection_manager: ConnectionManager,
+        stream_command_tx: Sender<MarketDataCommand>,
     ) -> Self {
         Self {
             order_submission,
             risk_management,
             observability,
             connection_manager,
+            stream_command_tx,
         }
     }
 
@@ -84,6 +88,30 @@ impl GatewayService {
         self.order_submission.query_status(query).await
     }
 
+    pub async fn subscribe(&self, sub: MarketSubscription) -> Result<(), BrokerError> {
+        self.observability.record_outbound(RequestRecord {
+            id: sub.symbol.clone(),
+            raw_payload: serde_json::to_string(&sub).ok(),
+        });
+
+        self.stream_command_tx
+            .send(MarketDataCommand::Subscribe(sub))
+            .await
+            .map_err(|e| BrokerError::ConnectionFailed(format!("market data command send failed: {}", e)))
+    }
+
+    pub async fn unsubscribe(&self, sub: MarketSubscription) -> Result<(), BrokerError> {
+        self.observability.record_outbound(RequestRecord {
+            id: sub.symbol.clone(),
+            raw_payload: serde_json::to_string(&sub).ok(),
+        });
+
+        self.stream_command_tx
+            .send(MarketDataCommand::Unsubscribe(sub))
+            .await
+            .map_err(|e| BrokerError::ConnectionFailed(format!("market data command send failed: {}", e)))
+    }
+
     pub fn handle_execution_message(&self, _msg: ExecutionMessage) {}
     pub fn handle_market_data(&self, _msg: Message) {}
 
@@ -95,6 +123,11 @@ impl GatewayService {
 }
 
 impl IMarketDataPort for GatewayService {
-    fn subscribe(&self, _sub: MarketSubscription) {}
-    fn unsubscribe(&self, _sub: MarketSubscription) {}
+    fn subscribe(&self, sub: MarketSubscription) {
+        let _ = self.stream_command_tx.try_send(MarketDataCommand::Subscribe(sub));
+    }
+
+    fn unsubscribe(&self, sub: MarketSubscription) {
+        let _ = self.stream_command_tx.try_send(MarketDataCommand::Unsubscribe(sub));
+    }
 }

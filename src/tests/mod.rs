@@ -685,3 +685,148 @@ mod alpaca_stream_normalizer_tests {
         assert!(events.is_empty());
     }
 }
+// ---------------------------------------------------------------------------
+// Subscription Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod subscription_tests {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use super::*;
+    use crate::adapters::broker::mock_adapter::MockAdapter;
+    use crate::core::application::connection_manager::ConnectionManager;
+    use crate::core::application::gateway_service::GatewayService;
+    use crate::core::application::idempotency::IdempotencyStore;
+    use crate::core::application::kill_switch::KillSwitch;
+    use crate::core::application::observability_service::ObservabilityService;
+    use crate::core::application::order_submission_service::OrderSubmissionService;
+    use crate::core::application::rate_limiter::RateLimiterManager;
+    use crate::core::application::risk_management_service::RiskManagementService;
+    use crate::core::application::validator::RequestValidator;
+    use crate::core::domain::market_data::{MarketSubscription, MarketDataCommand};
+    use crate::core::patterns::circuit_breaker::CircuitBreaker;
+    use crate::core::ports::journal_repo::IJournalRepo;
+    use crate::core::ports::observability::IObservability;
+    use crate::core::ports::service_traits::{IOrderSubmissionService, IRiskManagementService, IObservabilityService};
+
+    /// Mock journal repo that does nothing
+    struct MockJournalRepo;
+    impl IJournalRepo for MockJournalRepo {
+        fn persist_outbound(&self, _record: crate::core::domain::journal::RequestRecord) {}
+        fn persist_inbound(&self, _record: crate::core::domain::journal::ResponseRecord) {}
+        fn replay(&self, _query: String) -> Vec<crate::core::domain::journal::ResponseRecord> {
+            Vec::new()
+        }
+    }
+
+    fn make_gateway_service() -> (GatewayService, mpsc::Receiver<MarketDataCommand>) {
+        let (stream_tx, stream_rx) = mpsc::channel(32);
+
+        let order_submission = Arc::new(OrderSubmissionService::new(
+            RequestValidator,
+            IdempotencyStore::default(),
+            Box::new(MockAdapter::default()),
+            Arc::new(KillSwitch::default()),
+            Arc::new(RateLimiterManager::new(200.0)),
+            Arc::new(CircuitBreaker::new("test", 3, 30, noop_obs())),
+            "test",
+        )) as Arc<dyn IOrderSubmissionService>;
+
+        let risk_management = Arc::new(RiskManagementService::new(
+            KillSwitch::default(),
+            RateLimiterManager::new(200.0),
+        )) as Arc<dyn IRiskManagementService>;
+
+        let observability = Arc::new(ObservabilityService::new(
+            crate::core::patterns::telemetry_decorator::TelemetryDecorator,
+            noop_obs(),
+            Arc::new(MockJournalRepo),
+        )) as Arc<dyn IObservabilityService>;
+
+        let gateway = GatewayService::new(
+            order_submission,
+            risk_management,
+            observability,
+            ConnectionManager::new(5, 500),
+            stream_tx,
+        );
+
+        (gateway, stream_rx)
+    }
+
+    #[tokio::test]
+    async fn subscribe_sends_command_to_stream() {
+        let (gateway, mut rx) = make_gateway_service();
+        let subscription = MarketSubscription { symbol: "TSLA".to_string() };
+
+        // Subscribe
+        let result = gateway.subscribe(subscription.clone()).await;
+        assert!(result.is_ok());
+
+        // Check that the command was sent
+        if let Some(cmd) = rx.recv().await {
+            assert!(matches!(cmd, MarketDataCommand::Subscribe(s) if s.symbol == "TSLA"));
+        } else {
+            panic!("Expected subscribe command");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_sends_command_to_stream() {
+        let (gateway, mut rx) = make_gateway_service();
+        let subscription = MarketSubscription { symbol: "GOOGL".to_string() };
+
+        // Unsubscribe
+        let result = gateway.unsubscribe(subscription.clone()).await;
+        assert!(result.is_ok());
+
+        // Check that the command was sent
+        if let Some(cmd) = rx.recv().await {
+            assert!(matches!(cmd, MarketDataCommand::Unsubscribe(s) if s.symbol == "GOOGL"));
+        } else {
+            panic!("Expected unsubscribe command");
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_subscriptions_send_multiple_commands() {
+        let (gateway, mut rx) = make_gateway_service();
+
+        // Subscribe to multiple symbols
+        let tsla_sub = MarketSubscription { symbol: "TSLA".to_string() };
+        let aapl_sub = MarketSubscription { symbol: "AAPL".to_string() };
+
+        gateway.subscribe(tsla_sub).await.unwrap();
+        gateway.subscribe(aapl_sub).await.unwrap();
+
+        // Check both commands were sent
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            if let Some(cmd) = rx.recv().await {
+                received.push(cmd);
+            }
+        }
+
+        assert_eq!(received.len(), 2);
+        assert!(received.iter().any(|cmd| matches!(cmd, MarketDataCommand::Subscribe(s) if s.symbol == "TSLA")));
+        assert!(received.iter().any(|cmd| matches!(cmd, MarketDataCommand::Subscribe(s) if s.symbol == "AAPL")));
+    }
+
+    #[tokio::test]
+    async fn subscribe_unsubscribe_sequence() {
+        let (gateway, mut rx) = make_gateway_service();
+        let subscription = MarketSubscription { symbol: "MSFT".to_string() };
+
+        // Subscribe then unsubscribe
+        gateway.subscribe(subscription.clone()).await.unwrap();
+        gateway.unsubscribe(subscription).await.unwrap();
+
+        // Check both commands were sent in order
+        let cmd1 = rx.recv().await.unwrap();
+        let cmd2 = rx.recv().await.unwrap();
+
+        assert!(matches!(cmd1, MarketDataCommand::Subscribe(s) if s.symbol == "MSFT"));
+        assert!(matches!(cmd2, MarketDataCommand::Unsubscribe(s) if s.symbol == "MSFT"));
+    }
+}

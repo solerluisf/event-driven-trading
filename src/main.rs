@@ -20,6 +20,8 @@ use crate::adapters::messaging::bus_adapter::BusAdapter;
 use crate::adapters::messaging::market_data_publisher::MarketDataPublisher;
 use crate::adapters::metrics::metrics_adapter::MetricsAdapter;
 use crate::adapters::persistence::journal_storage::JournalStorage;
+use crate::core::domain::market_data::MarketDataCommand;
+use tokio::sync::mpsc;
 
 use crate::core::domain::broker_config::BrokerConfig;
 
@@ -120,12 +122,16 @@ async fn main() {
         cfg.reconnect_base_ms,
     ));
 
+    // ── Market data command channel ──────────────────────────────────────────
+    let (stream_command_tx, stream_command_rx) = mpsc::channel::<MarketDataCommand>(32);
+
     // ── Gateway ───────────────────────────────────────────────────────────────
     let gateway = Arc::new(GatewayService::new(
         order_submission,
         risk_management,
         observability,
         ConnectionManager::new(cfg.reconnect_max_attempts, cfg.reconnect_base_ms),
+        stream_command_tx.clone(),
     ));
 
     // ── Market data PUB socket (actor) ────────────────────────────────────────
@@ -140,6 +146,7 @@ async fn main() {
         stream_config,
         publisher.clone(),
         Arc::clone(&stream_connection_manager),
+        stream_command_rx,
     );
 
     // ── ZeroMQ REP listener ───────────────────────────────────────────────────
