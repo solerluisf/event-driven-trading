@@ -17,9 +17,10 @@ use crate::config::app_config::AppConfig;
 use crate::adapters::broker::adapter_factory::AdapterFactory;
 use crate::adapters::broker::alpaca_stream::{AlpacaStreamConfig, self as alpaca_stream};
 use crate::adapters::messaging::bus_adapter::BusAdapter;
-use crate::adapters::messaging::market_data_publisher::MarketDataPublisher;
+use crate::adapters::messaging::market_data_publisher::{MarketDataEvent, MarketDataPublisher};
 use crate::adapters::metrics::metrics_adapter::MetricsAdapter;
 use crate::adapters::persistence::journal_storage::JournalStorage;
+use crate::core::application::event_reactor::EventReactor;
 use crate::core::domain::market_data::MarketDataCommand;
 use tokio::sync::mpsc;
 
@@ -34,7 +35,7 @@ use crate::core::application::order_submission_service::OrderSubmissionService;
 use crate::core::application::rate_limiter::RateLimiterManager;
 use crate::core::application::risk_management_service::RiskManagementService;
 use crate::core::application::validator::RequestValidator;
-use crate::core::application::service_impls; // registers trait impls
+ // registers trait impls
 
 use crate::core::patterns::circuit_breaker::CircuitBreaker;
 use crate::core::patterns::telemetry_decorator::TelemetryDecorator;
@@ -129,10 +130,18 @@ async fn main() {
     let gateway = Arc::new(GatewayService::new(
         order_submission,
         risk_management,
-        observability,
+        Arc::clone(&observability),
         ConnectionManager::new(cfg.reconnect_max_attempts, cfg.reconnect_base_ms),
         stream_command_tx.clone(),
     ));
+
+    // ── Event reactor for symbol-specific market data handling ────────────────
+    let (reactor_tx, reactor_rx) = mpsc::channel::<MarketDataEvent>(128);
+    let _event_reactor = EventReactor::spawn(
+        reactor_rx,
+        Arc::clone(&observability),
+        Arc::clone(&kill_switch),
+    );
 
     // ── Market data PUB socket (actor) ────────────────────────────────────────
     let (publisher, publisher_handle) = MarketDataPublisher::spawn(&cfg.zmq_pub_endpoint);
@@ -145,6 +154,7 @@ async fn main() {
     let stream_handle = alpaca_stream::spawn(
         stream_config,
         publisher.clone(),
+        reactor_tx.clone(),
         Arc::clone(&stream_connection_manager),
         stream_command_rx,
     );

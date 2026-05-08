@@ -1,5 +1,6 @@
 // core/application/mod.rs
 pub mod connection_manager;
+pub mod event_reactor;
 pub mod gateway_service;
 pub mod idempotency;
 pub mod kill_switch;

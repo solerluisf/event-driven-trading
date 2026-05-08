@@ -24,7 +24,7 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::adapters::messaging::market_data_publisher::{
@@ -93,10 +93,11 @@ impl AlpacaStreamConfig {
 pub fn spawn(
     config: AlpacaStreamConfig,
     publisher: MarketDataPublisher,
+    reactor_tx: Sender<MarketDataEvent>,
     connection_manager: Arc<ConnectionManager>,
     stream_command_rx: Receiver<MarketDataCommand>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(stream_loop(config, publisher, connection_manager, stream_command_rx))
+    tokio::spawn(stream_loop(config, publisher, reactor_tx, connection_manager, stream_command_rx))
 }
 
 // ── Stream loop ───────────────────────────────────────────────────────────────
@@ -104,6 +105,7 @@ pub fn spawn(
 async fn stream_loop(
     config: AlpacaStreamConfig,
     publisher: MarketDataPublisher,
+    reactor_tx: Sender<MarketDataEvent>,
     connection_manager: Arc<ConnectionManager>,
     mut stream_command_rx: Receiver<MarketDataCommand>,
 ) {
@@ -145,7 +147,7 @@ async fn stream_loop(
         // Actually run the stream. We reconnect the WS ourselves here rather
         // than inside the closure above, so we can hold the ws split across
         // the whole session.
-        match run_stream(&config, pub_clone, &mut stream_command_rx).await {
+        match run_stream(&config, pub_clone, &reactor_tx, &mut stream_command_rx).await {
             Ok(()) => {
                 tracing::info!("alpaca_stream: stream ended cleanly, reconnecting");
             }
@@ -160,6 +162,7 @@ async fn stream_loop(
 async fn run_stream(
     config: &AlpacaStreamConfig,
     publisher: MarketDataPublisher,
+    reactor_tx: &Sender<MarketDataEvent>,
     stream_command_rx: &mut Receiver<MarketDataCommand>,
 ) -> Result<(), String> {
     let url = format!(
@@ -218,7 +221,7 @@ async fn run_stream(
             msg_result = read.next() => {
                 match msg_result {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_message(&text, &publisher).await {
+                        if let Err(e) = handle_message(&text, &publisher, Some(reactor_tx)).await {
                             tracing::warn!("alpaca_stream: message handling error: {}", e);
                         }
                     }
@@ -340,8 +343,11 @@ where
 // ── Message normalizer ────────────────────────────────────────────────────────
 
 /// Parse a raw text frame from Alpaca and publish any trade/quote/bar events.
-async fn handle_message(text: &str, publisher: &MarketDataPublisher) -> Result<(), String> {
-    // Alpaca wraps all messages in a JSON array
+async fn handle_message(
+    text: &str,
+    publisher: &MarketDataPublisher,
+    reactor_tx: Option<&Sender<MarketDataEvent>>,
+) -> Result<(), String> {
     let frames: Vec<Value> = serde_json::from_str(text)
         .map_err(|e| format!("JSON parse error: {} — raw: {}", e, text))?;
 
@@ -355,24 +361,39 @@ async fn handle_message(text: &str, publisher: &MarketDataPublisher) -> Result<(
             "t" => {
                 // Trade
                 if let Some(event) = normalize_trade(&frame) {
-                    if let Err(e) = publisher.publish(event).await {
+                    if let Err(e) = publisher.publish(event.clone()).await {
                         tracing::warn!("alpaca_stream: publish failed: {}", e);
+                    }
+                    if let Some(tx) = reactor_tx {
+                        if let Err(err) = tx.try_send(event) {
+                            tracing::warn!("alpaca_stream: reactor queue full or closed: {}", err);
+                        }
                     }
                 }
             }
             "q" => {
                 // Quote
                 if let Some(event) = normalize_quote(&frame) {
-                    if let Err(e) = publisher.publish(event).await {
+                    if let Err(e) = publisher.publish(event.clone()).await {
                         tracing::warn!("alpaca_stream: publish failed: {}", e);
+                    }
+                    if let Some(tx) = reactor_tx {
+                        if let Err(err) = tx.try_send(event) {
+                            tracing::warn!("alpaca_stream: reactor queue full or closed: {}", err);
+                        }
                     }
                 }
             }
             "b" => {
                 // Bar
                 if let Some(event) = normalize_bar(&frame) {
-                    if let Err(e) = publisher.publish(event).await {
+                    if let Err(e) = publisher.publish(event.clone()).await {
                         tracing::warn!("alpaca_stream: publish failed: {}", e);
+                    }
+                    if let Some(tx) = reactor_tx {
+                        if let Err(err) = tx.try_send(event) {
+                            tracing::warn!("alpaca_stream: reactor queue full or closed: {}", err);
+                        }
                     }
                 }
             }
@@ -483,5 +504,5 @@ pub async fn handle_message_test(
     text: &str,
     publisher: &crate::adapters::messaging::market_data_publisher::MarketDataPublisher,
 ) -> Result<(), String> {
-    handle_message(text, publisher).await
+    handle_message(text, publisher, None).await
 }
