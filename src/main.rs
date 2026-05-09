@@ -18,6 +18,7 @@ use crate::adapters::broker::adapter_factory::AdapterFactory;
 use crate::adapters::broker::alpaca_stream::{AlpacaStreamConfig, self as alpaca_stream};
 use crate::adapters::messaging::bus_adapter::BusAdapter;
 use crate::adapters::messaging::market_data_publisher::{MarketDataEvent, MarketDataPublisher};
+use crate::adapters::messaging::order_lifecycle_publisher::OrderLifecyclePublisher;
 use crate::adapters::messaging::wire_codec::{
     strict_msgpack_decode_enabled, wire_codec_metrics_snapshot,
 };
@@ -134,6 +135,12 @@ async fn main() {
     // ── Market data command channel ──────────────────────────────────────────
     let (stream_command_tx, stream_command_rx) = mpsc::channel::<MarketDataCommand>(32);
 
+    // ── Market data PUB socket (actor) ────────────────────────────────────────
+    let (publisher, publisher_handle) = MarketDataPublisher::spawn(&cfg.zmq_pub_endpoint);
+
+    // ── Order lifecycle PUB socket (actor) ────────────────────────────────────
+    let (order_lifecycle_publisher, order_lifecycle_handle) = OrderLifecyclePublisher::spawn(&cfg.zmq_order_lifecycle_endpoint);
+
     // ── Gateway ───────────────────────────────────────────────────────────────
     let gateway = Arc::new(GatewayService::new(
         order_submission,
@@ -141,6 +148,7 @@ async fn main() {
         Arc::clone(&observability),
         ConnectionManager::new(cfg.reconnect_max_attempts, cfg.reconnect_base_ms),
         stream_command_tx.clone(),
+        order_lifecycle_publisher,
     ));
 
     // ── Event reactor for symbol-specific market data handling ────────────────
@@ -150,9 +158,6 @@ async fn main() {
         Arc::clone(&observability),
         Arc::clone(&kill_switch),
     );
-
-    // ── Market data PUB socket (actor) ────────────────────────────────────────
-    let (publisher, publisher_handle) = MarketDataPublisher::spawn(&cfg.zmq_pub_endpoint);
 
     // ── Alpaca market data stream ─────────────────────────────────────────────
     let stream_config = AlpacaStreamConfig::from_env(
@@ -181,7 +186,7 @@ async fn main() {
         initial_wire_metrics.encode_error_total
     );
 
-    // Run all three concurrently; stop if any fails
+    // Run all four concurrently; stop if any fails
     tokio::select! {
         result = bus.listen() => {
             if let Err(e) = result {
@@ -191,7 +196,13 @@ async fn main() {
         }
         result = publisher_handle => {
             if let Err(e) = result {
-                error!("Publisher actor error: {}", e);
+                error!("Market data Publisher actor error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        result = order_lifecycle_handle => {
+            if let Err(e) = result {
+                error!("Order lifecycle Publisher actor error: {}", e);
                 std::process::exit(1);
             }
         }

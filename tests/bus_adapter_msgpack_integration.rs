@@ -24,6 +24,7 @@ use broker_gateway_service::core::ports::observability::IObservability;
 use broker_gateway_service::core::ports::service_traits::{
     IObservabilityService, IOrderSubmissionService, IRiskManagementService,
 };
+use broker_gateway_service::adapters::messaging::order_lifecycle_publisher::OrderLifecyclePublisher;
 use tokio::sync::mpsc;
 
 struct NoopObservability;
@@ -57,6 +58,10 @@ fn make_gateway_service() -> GatewayService {
         while stream_rx.recv().await.is_some() {}
     });
 
+    // Create a test order lifecycle publisher
+    let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
+    let order_lifecycle_publisher = OrderLifecyclePublisher::from_sender(lifecycle_tx);
+
     let order_submission = Arc::new(OrderSubmissionService::new(
         RequestValidator,
         IdempotencyStore::default(),
@@ -84,6 +89,7 @@ fn make_gateway_service() -> GatewayService {
         observability,
         ConnectionManager::new(5, 500),
         stream_tx,
+        order_lifecycle_publisher,
     )
 }
 

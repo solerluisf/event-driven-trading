@@ -702,6 +702,7 @@ mod subscription_tests {
     use tokio::sync::mpsc;
     use super::*;
     use crate::adapters::broker::mock_adapter::MockAdapter;
+    use crate::adapters::messaging::order_lifecycle_publisher::OrderLifecyclePublisher;
     use crate::core::application::connection_manager::ConnectionManager;
     use crate::core::application::gateway_service::GatewayService;
     use crate::core::application::idempotency::IdempotencyStore;
@@ -729,6 +730,10 @@ mod subscription_tests {
 
     fn make_gateway_service() -> (GatewayService, mpsc::Receiver<MarketDataCommand>) {
         let (stream_tx, stream_rx) = mpsc::channel(32);
+        
+        // Create a test order lifecycle publisher (inproc for testing)
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
+        let order_lifecycle_publisher = OrderLifecyclePublisher::from_sender(lifecycle_tx);
 
         let order_submission = Arc::new(OrderSubmissionService::new(
             RequestValidator,
@@ -757,6 +762,7 @@ mod subscription_tests {
             observability,
             ConnectionManager::new(5, 500),
             stream_tx,
+            order_lifecycle_publisher,
         );
 
         (gateway, stream_rx)

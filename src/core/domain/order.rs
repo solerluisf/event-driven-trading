@@ -77,3 +77,44 @@ pub struct ReplaceCmd {
 pub struct StatusQuery {
     pub execution_id: ExecutionId,
 }
+
+// --- Order Lifecycle Events for PUB/SUB ---
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OrderLifecycleEvent {
+    /// Unique identifier for this event
+    pub event_id: String,
+    /// The order's execution ID (from the broker)
+    pub execution_id: String,
+    /// Client-provided order ID if available
+    pub client_order_id: Option<String>,
+    /// Trading symbol
+    pub symbol: String,
+    /// Event type (submitted, filled, rejected, cancelled, etc.)
+    pub event_type: OrderLifecycleEventType,
+    /// Timestamp when the event occurred (ISO 8601)
+    pub timestamp: String,
+    /// Additional event-specific payload
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderLifecycleEventType {
+    /// Order was successfully submitted to the broker
+    Submitted,
+    /// Order was partially filled
+    PartialFill,
+    /// Order was completely filled
+    Filled,
+    /// Order was rejected by the broker
+    Rejected,
+    /// Order was cancelled
+    Cancelled,
+    /// Order was replaced/modified
+    Replaced,
+    /// Order expired
+    Expired,
+    /// Error occurred during order processing
+    Error,
+}

@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapters::messaging::market_data_publisher::MarketDataEvent;
+use crate::core::domain::order::OrderLifecycleEvent;
 use crate::core::domain::wire_message::{GatewayRequest, GatewayResponse};
 
 const MSGPACK_MAGIC: &[u8; 4] = b"BGW1";
@@ -105,6 +106,14 @@ pub fn decode_market_data_event(bytes: &[u8]) -> Result<(MarketDataEvent, WireFo
     decode_with_fallback(bytes)
 }
 
+pub fn encode_order_lifecycle_event(event: &OrderLifecycleEvent) -> Result<Vec<u8>, String> {
+    encode_msgpack(event)
+}
+
+pub fn decode_order_lifecycle_event(bytes: &[u8]) -> Result<(OrderLifecycleEvent, WireFormat), String> {
+    decode_with_fallback(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +202,154 @@ mod tests {
         assert!(decode_gateway_request(&framed).is_err());
         assert!(decode_gateway_response(&framed).is_err());
         assert!(decode_market_data_event(&framed).is_err());
+    }
+
+    // --- Order Lifecycle Event Tests ---
+
+    use crate::core::domain::order::{OrderLifecycleEvent, OrderLifecycleEventType};
+
+    #[test]
+    fn order_lifecycle_event_round_trip_msgpack() {
+        let event = OrderLifecycleEvent {
+            event_id: "evt-123".to_string(),
+            execution_id: "exec-456".to_string(),
+            client_order_id: Some("client-789".to_string()),
+            symbol: "AAPL".to_string(),
+            event_type: OrderLifecycleEventType::Filled,
+            timestamp: "2026-05-08T10:00:00Z".to_string(),
+            payload: json!({
+                "filled_qty": 100,
+                "filled_price": 150.25,
+            }),
+        };
+
+        let encoded = encode_order_lifecycle_event(&event).expect("encode should succeed");
+        let (decoded, format) =
+            decode_order_lifecycle_event(&encoded).expect("decode should succeed");
+
+        assert_eq!(format, WireFormat::MessagePack);
+        assert_eq!(decoded.event_id, "evt-123");
+        assert_eq!(decoded.execution_id, "exec-456");
+        assert_eq!(decoded.client_order_id, Some("client-789".to_string()));
+        assert_eq!(decoded.symbol, "AAPL");
+        assert_eq!(decoded.event_type, OrderLifecycleEventType::Filled);
+        assert_eq!(decoded.timestamp, "2026-05-08T10:00:00Z");
+        assert_eq!(decoded.payload["filled_qty"], 100);
+        assert_eq!(decoded.payload["filled_price"], 150.25);
+    }
+
+    #[test]
+    fn order_lifecycle_event_round_trip_all_types() {
+        let event_types = vec![
+            OrderLifecycleEventType::Submitted,
+            OrderLifecycleEventType::PartialFill,
+            OrderLifecycleEventType::Filled,
+            OrderLifecycleEventType::Rejected,
+            OrderLifecycleEventType::Cancelled,
+            OrderLifecycleEventType::Replaced,
+            OrderLifecycleEventType::Expired,
+            OrderLifecycleEventType::Error,
+        ];
+
+        for event_type in event_types {
+            let event = OrderLifecycleEvent {
+                event_id: "evt-123".to_string(),
+                execution_id: "exec-456".to_string(),
+                client_order_id: None,
+                symbol: "MSFT".to_string(),
+                event_type: event_type.clone(),
+                timestamp: "2026-05-08T10:00:00Z".to_string(),
+                payload: json!({"test": true}),
+            };
+
+            let encoded = encode_order_lifecycle_event(&event).expect("encode should succeed");
+            let (decoded, format) =
+                decode_order_lifecycle_event(&encoded).expect("decode should succeed");
+
+            assert_eq!(format, WireFormat::MessagePack);
+            assert_eq!(decoded.event_type, event_type, "event type should match after round-trip");
+        }
+    }
+
+    #[test]
+    fn order_lifecycle_event_decodes_legacy_json_fallback() {
+        let event = OrderLifecycleEvent {
+            event_id: "evt-json".to_string(),
+            execution_id: "exec-json".to_string(),
+            client_order_id: Some("client-json".to_string()),
+            symbol: "TSLA".to_string(),
+            event_type: OrderLifecycleEventType::Submitted,
+            timestamp: "2026-05-08T10:00:00Z".to_string(),
+            payload: json!({"test": "json"}),
+        };
+
+        let json_bytes = serde_json::to_vec(&event).expect("json serialize should succeed");
+
+        let (decoded, format) =
+            decode_order_lifecycle_event(&json_bytes).expect("json fallback decode should succeed");
+
+        assert_eq!(format, WireFormat::Json);
+        assert_eq!(decoded.event_id, "evt-json");
+        assert_eq!(decoded.event_type, OrderLifecycleEventType::Submitted);
+        assert_eq!(decoded.payload["test"], "json");
+    }
+
+    #[test]
+    fn order_lifecycle_event_without_client_order_id() {
+        let event = OrderLifecycleEvent {
+            event_id: "evt-123".to_string(),
+            execution_id: "exec-456".to_string(),
+            client_order_id: None,
+            symbol: "AAPL".to_string(),
+            event_type: OrderLifecycleEventType::Filled,
+            timestamp: "2026-05-08T10:00:00Z".to_string(),
+            payload: json!({}),
+        };
+
+        let encoded = encode_order_lifecycle_event(&event).expect("encode should succeed");
+        let (decoded, _) = decode_order_lifecycle_event(&encoded).expect("decode should succeed");
+
+        assert!(decoded.client_order_id.is_none());
+    }
+
+    #[test]
+    fn decode_invalid_payload_for_order_lifecycle() {
+        let bad_payload = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        assert!(decode_order_lifecycle_event(&bad_payload).is_err());
+        
+        // Test with BGW1 magic but invalid payload
+        let mut framed = b"BGW1".to_vec();
+        framed.extend_from_slice(&[0xC1, 0xC1, 0xC1]);
+        assert!(decode_order_lifecycle_event(&framed).is_err());
+    }
+
+    #[test]
+    fn order_lifecycle_event_with_complex_payload() {
+        let event = OrderLifecycleEvent {
+            event_id: "evt-complex".to_string(),
+            execution_id: "exec-complex".to_string(),
+            client_order_id: Some("client-123".to_string()),
+            symbol: "AAPL".to_string(),
+            event_type: OrderLifecycleEventType::PartialFill,
+            timestamp: "2026-05-08T10:00:00Z".to_string(),
+            payload: json!({
+                "filled_qty": 50,
+                "filled_price": 150.50,
+                "remaining_qty": 50,
+                "execution_venue": "NYSE",
+                "liquidity": "remove",
+                "metadata": {
+                    "algo_id": "algo-1",
+                    "session_id": "session-abc"
+                }
+            }),
+        };
+
+        let encoded = encode_order_lifecycle_event(&event).expect("encode should succeed");
+        let (decoded, _) = decode_order_lifecycle_event(&encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.payload["filled_qty"], 50);
+        assert_eq!(decoded.payload["execution_venue"], "NYSE");
+        assert_eq!(decoded.payload["metadata"]["algo_id"], "algo-1");
     }
 }

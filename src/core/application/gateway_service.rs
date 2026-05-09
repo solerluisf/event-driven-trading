@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::adapters::messaging::order_lifecycle_publisher::OrderLifecyclePublisher;
 use crate::core::ports::service_traits::{
     IOrderSubmissionService,
     IRiskManagementService,
@@ -25,6 +26,7 @@ pub struct GatewayService {
     observability:    Arc<dyn IObservabilityService>,
     connection_manager: ConnectionManager,
     stream_command_tx: Sender<MarketDataCommand>,
+    order_lifecycle_publisher: OrderLifecyclePublisher,
 }
 
 impl GatewayService {
@@ -34,6 +36,7 @@ impl GatewayService {
         observability:    Arc<dyn IObservabilityService>,
         connection_manager: ConnectionManager,
         stream_command_tx: Sender<MarketDataCommand>,
+        order_lifecycle_publisher: OrderLifecyclePublisher,
     ) -> Self {
         Self {
             order_submission,
@@ -41,6 +44,7 @@ impl GatewayService {
             observability,
             connection_manager,
             stream_command_tx,
+            order_lifecycle_publisher,
         }
     }
 
@@ -55,7 +59,20 @@ impl GatewayService {
         });
 
         // Submit
-        let execution_id = self.order_submission.submit_order(cmd).await?;
+        let execution_id = self.order_submission.submit_order(cmd.clone()).await?;
+
+        // Publish order submitted event to PUB socket
+        let client_order_id = cmd.client_order_id.clone();
+        let symbol = cmd.symbol.clone();
+        let exec_id = execution_id.0.clone();
+        let event = crate::adapters::messaging::order_lifecycle_publisher::create_submitted_event(
+            &exec_id,
+            &symbol,
+            client_order_id,
+        );
+        if let Err(e) = self.order_lifecycle_publisher.publish(event).await {
+            tracing::warn!("failed to publish order submitted event: {}", e);
+        }
 
         // Journal the inbound confirmation
         self.observability.record_inbound(ResponseRecord {
@@ -72,7 +89,23 @@ impl GatewayService {
             id: cmd.execution_id.0.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
         });
-        self.order_submission.cancel_order(cmd).await
+        let exec_id = cmd.execution_id.0.clone();
+        
+        match self.order_submission.cancel_order(cmd).await {
+            Ok(()) => {
+                // Publish order cancelled event to PUB socket
+                let event = crate::adapters::messaging::order_lifecycle_publisher::create_cancelled_event(
+                    &exec_id,
+                    "unknown", // Symbol not available in CancelCmd, using placeholder
+                    None,
+                );
+                if let Err(e) = self.order_lifecycle_publisher.publish(event).await {
+                    tracing::warn!("failed to publish order cancelled event: {}", e);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), BrokerError> {
@@ -81,7 +114,32 @@ impl GatewayService {
             id: cmd.execution_id.0.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
         });
-        self.order_submission.replace_order(cmd).await
+        let exec_id = cmd.execution_id.0.clone();
+        let symbol = cmd.symbol.clone();
+        
+        match self.order_submission.replace_order(cmd).await {
+            Ok(()) => {
+                // Publish order replaced event to PUB socket
+                use crate::core::domain::order::{OrderLifecycleEvent, OrderLifecycleEventType};
+                use serde_json::json;
+                use uuid::Uuid;
+                
+                let event = OrderLifecycleEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    execution_id: exec_id,
+                    client_order_id: None,
+                    symbol,
+                    event_type: OrderLifecycleEventType::Replaced,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    payload: json!({}),
+                };
+                if let Err(e) = self.order_lifecycle_publisher.publish(event).await {
+                    tracing::warn!("failed to publish order replaced event: {}", e);
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn query_status(&self, query: StatusQuery) -> Result<(), BrokerError> {
@@ -110,6 +168,71 @@ impl GatewayService {
             .send(MarketDataCommand::Unsubscribe(sub))
             .await
             .map_err(|e| BrokerError::ConnectionFailed(format!("market data command send failed: {}", e)))
+    }
+
+    /// Publish an order filled event to the order lifecycle PUB socket.
+    /// This can be called when receiving fill confirmations from the broker.
+    pub async fn publish_fill_event(
+        &self,
+        execution_id: impl Into<String>,
+        symbol: impl Into<String>,
+        client_order_id: Option<String>,
+        filled_qty: u32,
+        filled_price: f64,
+    ) {
+        let event = crate::adapters::messaging::order_lifecycle_publisher::create_filled_event(
+            execution_id,
+            symbol,
+            client_order_id,
+            filled_qty,
+            filled_price,
+        );
+        if let Err(e) = self.order_lifecycle_publisher.publish(event).await {
+            tracing::warn!("failed to publish order filled event: {}", e);
+        }
+    }
+
+    /// Publish an order rejected event to the order lifecycle PUB socket.
+    /// This can be called when receiving rejections from the broker.
+    pub async fn publish_rejected_event(
+        &self,
+        execution_id: impl Into<String>,
+        symbol: impl Into<String>,
+        client_order_id: Option<String>,
+        reason: impl Into<String>,
+    ) {
+        let event = crate::adapters::messaging::order_lifecycle_publisher::create_rejected_event(
+            execution_id,
+            symbol,
+            client_order_id,
+            reason,
+        );
+        if let Err(e) = self.order_lifecycle_publisher.publish(event).await {
+            tracing::warn!("failed to publish order rejected event: {}", e);
+        }
+    }
+
+    /// Publish a partial fill event to the order lifecycle PUB socket.
+    pub async fn publish_partial_fill_event(
+        &self,
+        execution_id: impl Into<String>,
+        symbol: impl Into<String>,
+        client_order_id: Option<String>,
+        filled_qty: u32,
+        filled_price: f64,
+        remaining_qty: u32,
+    ) {
+        let event = crate::adapters::messaging::order_lifecycle_publisher::create_partial_fill_event(
+            execution_id,
+            symbol,
+            client_order_id,
+            filled_qty,
+            filled_price,
+            remaining_qty,
+        );
+        if let Err(e) = self.order_lifecycle_publisher.publish(event).await {
+            tracing::warn!("failed to publish order partial fill event: {}", e);
+        }
     }
 
     pub fn handle_execution_message(&self, _msg: ExecutionMessage) {}

@@ -4,17 +4,18 @@
 // dotenvy already loads .env before this is called from main.rs.
 //
 // Variables and defaults:
-//   GATEWAY_ZMQ_REP_ENDPOINT   tcp://127.0.0.1:5555   inbound commands (REP)
-//   GATEWAY_ZMQ_PUB_ENDPOINT   tcp://127.0.0.1:5556   outbound market data (PUB)
-//   GATEWAY_BROKER             alpaca
-//   GATEWAY_RATE_LIMIT_RPM     200                    requests per minute
-//   GATEWAY_CB_THRESHOLD       3                      circuit breaker failure threshold
-//   GATEWAY_CB_COOLDOWN_SECS   30                     circuit breaker cooldown
-//   GATEWAY_RECONNECT_MAX      5                      max reconnect attempts
-//   GATEWAY_RECONNECT_BASE_MS  500                    initial back-off in ms
-//   JOURNAL_DB_PATH            journal.db
-//   MARKET_DATA_FEED           iex                    "iex", "sip", or "test"
-//   MARKET_DATA_SYMBOLS        AAPL,SPY               comma-separated list (or "*")
+//   GATEWAY_ZMQ_REP_ENDPOINT             tcp://127.0.0.1:5555   inbound commands (REP)
+//   GATEWAY_ZMQ_PUB_ENDPOINT             tcp://127.0.0.1:5556   outbound market data (PUB)
+//   GATEWAY_ZMQ_ORDER_LIFECYCLE_ENDPOINT tcp://127.0.0.1:5557   outbound order lifecycle events (PUB)
+//   GATEWAY_BROKER                       alpaca
+//   GATEWAY_RATE_LIMIT_RPM               200                    requests per minute
+//   GATEWAY_CB_THRESHOLD                 3                      circuit breaker failure threshold
+//   GATEWAY_CB_COOLDOWN_SECS             30                     circuit breaker cooldown
+//   GATEWAY_RECONNECT_MAX                5                      max reconnect attempts
+//   GATEWAY_RECONNECT_BASE_MS            500                    initial back-off in ms
+//   JOURNAL_DB_PATH                      journal.db
+//   MARKET_DATA_FEED                     iex                    "iex", "sip", or "test"
+//   MARKET_DATA_SYMBOLS                  AAPL,SPY               comma-separated list (or "*")
 
 use std::env;
 
@@ -24,6 +25,8 @@ pub struct AppConfig {
     pub zmq_rep_endpoint: String,
     /// ZeroMQ PUB endpoint — publishes market data
     pub zmq_pub_endpoint: String,
+    /// ZeroMQ PUB endpoint — publishes order lifecycle events
+    pub zmq_order_lifecycle_endpoint: String,
     /// Broker adapter to use
     pub broker: String,
     /// Rate limit in requests per minute
@@ -50,6 +53,7 @@ impl AppConfig {
         Self {
             zmq_rep_endpoint: env_str("GATEWAY_ZMQ_REP_ENDPOINT", "tcp://127.0.0.1:5555"),
             zmq_pub_endpoint: env_str("GATEWAY_ZMQ_PUB_ENDPOINT", "tcp://127.0.0.1:5556"),
+            zmq_order_lifecycle_endpoint: env_str("GATEWAY_ZMQ_ORDER_LIFECYCLE_ENDPOINT", "tcp://127.0.0.1:5557"),
             broker: env_str("GATEWAY_BROKER", "alpaca"),
             rate_limit_rpm: env_parse("GATEWAY_RATE_LIMIT_RPM", 200.0),
             cb_failure_threshold: env_parse("GATEWAY_CB_THRESHOLD", 3),
