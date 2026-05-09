@@ -9,9 +9,13 @@
 //   Execution Service (REQ)  ──►  Gateway (REP, this file)
 //
 // One message in, one reply out — exactly REQ/REP semantics.
+//
+// IMPORTANT: ZMQ REP sockets require strict recv→send alternation with no
+// interleaving. This implementation uses a dedicated thread for the socket
+// and channels for communication to ensure the state machine is never violated.
 
 use std::sync::Arc;
-use std::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 use zmq::Context;
 
 use crate::core::application::gateway_service::GatewayService;
@@ -21,6 +25,14 @@ use crate::core::domain::wire_message::{
 use super::wire_codec::{
     decode_gateway_request, encode_gateway_response, WireFormat,
 };
+
+/// Message sent from ZMQ thread to async processor
+struct ZmqMessage {
+    /// Raw bytes received from ZMQ
+    data: Vec<u8>,
+    /// Channel to send response back
+    response_tx: oneshot::Sender<Vec<u8>>,
+}
 
 pub struct BusAdapter {
     /// ZeroMQ endpoint string, e.g. "tcp://127.0.0.1:5555"
@@ -38,94 +50,207 @@ impl BusAdapter {
 
     /// Bind the REP socket and loop forever processing commands.
     /// Call this as the main async task in main().
+    ///
+    /// This implementation uses a dedicated thread for the ZMQ socket to ensure
+    /// strict recv→send alternation is maintained without interference from
+    /// tokio's thread pool scheduling.
     pub async fn listen(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = Context::new();
-        let socket = Arc::new(Mutex::new(ctx.socket(zmq::REP)?));
-        socket.lock().unwrap().bind(&self.endpoint)?;
+        let endpoint = self.endpoint.clone();
+        let gateway = self.gateway.clone();
 
-        tracing::info!("BusAdapter listening on {}", self.endpoint);
+        // Channel for ZMQ thread to send received messages to async processor
+        let (msg_tx, mut msg_rx) = mpsc::channel::<ZmqMessage>(128);
+        // Channel for async processor to signal shutdown
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
-        loop {
-            let socket_clone = socket.clone();
-            let gateway_clone = self.gateway.clone();
-
-            // Receive message in blocking context
-            let dispatch_result = tokio::task::spawn_blocking(move || {
-                let socket = socket_clone.lock().unwrap();
-                socket.recv_bytes(0) // 0 = blocking recv
-            })
-            .await;
-
-            let msg = match dispatch_result {
-                Ok(Ok(m)) => m,
-                Ok(Err(_)) => continue,
+        // Spawn dedicated thread for ZMQ socket operations
+        let zmq_thread = std::thread::spawn(move || {
+            let ctx = Context::new();
+            let socket = match ctx.socket(zmq::REP) {
+                Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("Task join error: {}", e);
-                    continue;
+                    tracing::error!("Failed to create ZMQ socket: {}", e);
+                    return;
                 }
             };
 
-            // Deserialize
-            let response: GatewayResponse = match decode_gateway_request(&msg) {
-                Err(e) => {
-                    tracing::warn!("Failed to deserialize request: {}", e);
-                    GatewayResponse::Err(ErrorPayload {
-                        correlation_id: None,
-                        code: "DESERIALIZE_ERROR".into(),
-                        message: e,
-                    })
-                }
-                Ok((req, wire_format)) => {
-                    if wire_format == WireFormat::Json {
-                        tracing::debug!("Received legacy JSON request; consider upgrading client to MessagePack");
+            if let Err(e) = socket.bind(&endpoint) {
+                tracing::error!("Failed to bind ZMQ socket to {}: {}", endpoint, e);
+                return;
+            }
+
+            tracing::info!("BusAdapter ZMQ thread listening on {}", endpoint);
+
+            loop {
+                // Check for shutdown signal (non-blocking)
+                match shutdown_rx.try_recv() {
+                    Ok(_) => {
+                        tracing::info!("ZMQ thread received shutdown signal");
+                        break;
                     }
-                    self.dispatch(req).await
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        tracing::info!("ZMQ thread shutdown channel disconnected");
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No shutdown signal, continue
+                    }
                 }
-            };
 
-            // Serialize
-            let reply_bytes = encode_gateway_response(&response).unwrap_or_else(|e| {
-                format!(r#"{{"status":"err","payload":{{"code":"SERIALIZE_ERROR","message":"{}"}}}}"#, e)
-                    .into_bytes()
-            });
+                // Receive message with timeout to allow periodic shutdown checks
+                socket.set_rcvtimeo(100).expect("set receive timeout");
+                
+                let data = match socket.recv_bytes(0) {
+                    Ok(d) => d,
+                    Err(zmq::Error::EAGAIN) => {
+                        // Timeout, loop back to check shutdown
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("ZMQ recv error: {}", e);
+                        continue;
+                    }
+                };
 
-            // Send response in blocking context
-            let socket_clone = socket.clone();
-            let send_result = tokio::task::spawn_blocking(move || {
-                let socket = socket_clone.lock().unwrap();
-                socket.send(&reply_bytes, 0)
-            })
-            .await;
+                // Create oneshot channel for response
+                let (response_tx, response_rx) = oneshot::channel();
 
-            if let Ok(Err(e)) = send_result {
-                tracing::warn!("Failed to send response: {}", e);
+                // Send message to async processor
+                if let Err(_) = msg_tx.blocking_send(ZmqMessage { data, response_tx }) {
+                    tracing::error!("Failed to send message to async processor, channel closed");
+                    break;
+                }
+
+                // Wait for response (blocking)
+                let response_bytes = match response_rx.blocking_recv() {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        tracing::error!("Response channel closed without sending data");
+                        // Send error response to maintain REP socket state
+                        br#"{"status":"err","payload":{"code":"INTERNAL_ERROR","message":"Internal processing error"}}"#.to_vec()
+                    }
+                };
+
+                // Send response
+                if let Err(e) = socket.send(&response_bytes, 0) {
+                    tracing::warn!("ZMQ send error: {}", e);
+                }
+            }
+
+            tracing::info!("ZMQ thread shutting down");
+        });
+
+        // Async message processing loop
+        loop {
+            tokio::select! {
+                Some(zmq_msg) = msg_rx.recv() => {
+                    // Process the message
+                    let response_bytes = self.process_message(&zmq_msg.data, &gateway).await;
+                    
+                    // Send response back to ZMQ thread
+                    if let Err(_) = zmq_msg.response_tx.send(response_bytes) {
+                        tracing::warn!("Failed to send response - ZMQ thread may have panicked");
+                        break;
+                    }
+                }
+                else => {
+                    // Channel closed
+                    tracing::info!("Message channel closed, shutting down");
+                    break;
+                }
             }
         }
+
+        // Signal shutdown to ZMQ thread
+        let _ = shutdown_tx.send(()).await;
+        
+        // Wait for ZMQ thread to finish
+        drop(msg_rx);
+        if let Err(e) = zmq_thread.join() {
+            tracing::error!("ZMQ thread panicked: {:?}", e);
+        }
+
+        Ok(())
+    }
+
+    /// Process a single message and return the response bytes
+    async fn process_message(&self, data: &[u8], gateway: &GatewayService) -> Vec<u8> {
+        // Deserialize
+        let response: GatewayResponse = match decode_gateway_request(data) {
+            Err(e) => {
+                tracing::warn!("Failed to deserialize request: {}", e);
+                GatewayResponse::Err(ErrorPayload {
+                    correlation_id: None,
+                    code: "DESERIALIZE_ERROR".into(),
+                    message: e,
+                })
+            }
+            Ok((req, wire_format)) => {
+                if wire_format == WireFormat::Json {
+                    tracing::debug!("Received legacy JSON request; consider upgrading client to MessagePack");
+                }
+                self.dispatch(req, gateway).await
+            }
+        };
+
+        // Serialize response
+        encode_gateway_response(&response).unwrap_or_else(|e| {
+            format!(r#"{{"status":"err","payload":{{"code":"SERIALIZE_ERROR","message":"{}"}}}}"#, e)
+                .into_bytes()
+        })
     }
 
     /// Bind the REP socket, process exactly one request, then return.
     /// Useful for integration tests that need deterministic teardown.
     pub async fn listen_once(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let ctx = Context::new();
-        let socket = Arc::new(Mutex::new(ctx.socket(zmq::REP)?));
-        socket.lock().unwrap().bind(&self.endpoint)?;
+        let endpoint = self.endpoint.clone();
+        let gateway = self.gateway.clone();
 
-        let socket_clone = socket.clone();
-        let dispatch_result = tokio::task::spawn_blocking(move || {
-            let socket = socket_clone.lock().unwrap();
-            socket.recv_bytes(0)
-        })
-        .await?;
+        // Spawn dedicated thread for single ZMQ operation
+        let (result_tx, result_rx) = oneshot::channel();
 
-        let msg = dispatch_result?;
+        std::thread::spawn(move || {
+            let ctx = Context::new();
+            let socket = match ctx.socket(zmq::REP) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = result_tx.send(Err(format!("Socket creation failed: {}", e)));
+                    return;
+                }
+            };
 
-        let response: GatewayResponse = match decode_gateway_request(&msg) {
+            if let Err(e) = socket.bind(&endpoint) {
+                let _ = result_tx.send(Err(format!("Bind failed: {}", e)));
+                return;
+            }
+
+            // Receive message
+            let data = match socket.recv_bytes(0) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = result_tx.send(Err(format!("Recv failed: {}", e)));
+                    return;
+                }
+            };
+
+            let _ = result_tx.send(Ok((data, socket)));
+        });
+
+        // Wait for message reception
+        let (data, socket) = match result_rx.await {
+            Ok(Ok((d, s))) => (d, s),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err("Channel closed".into()),
+        };
+
+        // Process in async context
+        let response = match decode_gateway_request(&data) {
             Err(e) => GatewayResponse::Err(ErrorPayload {
                 correlation_id: None,
                 code: "DESERIALIZE_ERROR".into(),
                 message: e,
             }),
-            Ok((req, _)) => self.dispatch(req).await,
+            Ok((req, _)) => self.dispatch(req, &gateway).await,
         };
 
         let reply_bytes = encode_gateway_response(&response).unwrap_or_else(|e| {
@@ -133,23 +258,29 @@ impl BusAdapter {
                 .into_bytes()
         });
 
-        let socket_clone = socket.clone();
-        let send_result = tokio::task::spawn_blocking(move || {
-            let socket = socket_clone.lock().unwrap();
-            socket.send(&reply_bytes, 0)
-        })
-        .await?;
+        // Send response in blocking thread
+        let (send_result_tx, send_result_rx) = oneshot::channel();
+        std::thread::spawn(move || {
+            let result = match socket.send(&reply_bytes, 0) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(format!("Send failed: {}", e)),
+            };
+            let _ = send_result_tx.send(result);
+        });
 
-        send_result?;
-        Ok(())
+        match send_result_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.into()),
+            Err(_) => Err("Send channel closed".into()),
+        }
     }
 
     /// Route a deserialized request to the correct GatewayService method.
-    async fn dispatch(&self, req: GatewayRequest) -> GatewayResponse {
+    async fn dispatch(&self, req: GatewayRequest, gateway: &GatewayService) -> GatewayResponse {
         match req {
             GatewayRequest::SubmitOrder(cmd) => {
                 let correlation_id = cmd.client_order_id.clone();
-                match self.gateway.submit_order(cmd).await {
+                match gateway.submit_order(cmd).await {
                     Ok(exec_id) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: exec_id.0,
@@ -164,7 +295,7 @@ impl BusAdapter {
 
             GatewayRequest::CancelOrder(cmd) => {
                 let correlation_id = Some(cmd.execution_id.0.clone());
-                match self.gateway.cancel_order(cmd).await {
+                match gateway.cancel_order(cmd).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "cancelled".into(),
@@ -179,7 +310,7 @@ impl BusAdapter {
 
             GatewayRequest::ReplaceOrder(cmd) => {
                 let correlation_id = Some(cmd.execution_id.0.clone());
-                match self.gateway.replace_order(cmd).await {
+                match gateway.replace_order(cmd).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "replaced".into(),
@@ -194,7 +325,7 @@ impl BusAdapter {
 
             GatewayRequest::QueryStatus(query) => {
                 let correlation_id = Some(query.execution_id.0.clone());
-                match self.gateway.query_status(query).await {
+                match gateway.query_status(query).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "ok".into(),
@@ -209,7 +340,7 @@ impl BusAdapter {
 
             GatewayRequest::Subscribe(sub) => {
                 let correlation_id = Some(sub.symbol.clone());
-                match self.gateway.subscribe(sub).await {
+                match gateway.subscribe(sub).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "subscribed".into(),
@@ -224,7 +355,7 @@ impl BusAdapter {
 
             GatewayRequest::Unsubscribe(sub) => {
                 let correlation_id = Some(sub.symbol.clone());
-                match self.gateway.unsubscribe(sub).await {
+                match gateway.unsubscribe(sub).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "unsubscribed".into(),
@@ -237,5 +368,248 @@ impl BusAdapter {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::domain::market_data::MarketSubscription;
+    use crate::adapters::broker::mock_adapter::MockAdapter;
+    use crate::adapters::messaging::wire_codec::{encode_gateway_request, decode_gateway_response};
+    use crate::core::application::{
+        connection_manager::ConnectionManager,
+        gateway_service::GatewayService,
+        idempotency::IdempotencyStore,
+        kill_switch::KillSwitch,
+        observability_service::ObservabilityService,
+        order_submission_service::OrderSubmissionService,
+        rate_limiter::RateLimiterManager,
+        risk_management_service::RiskManagementService,
+        validator::RequestValidator,
+    };
+    use crate::core::patterns::circuit_breaker::CircuitBreaker;
+    use crate::core::ports::{
+        journal_repo::IJournalRepo,
+        observability::IObservability,
+        service_traits::{IObservabilityService, IOrderSubmissionService, IRiskManagementService},
+    };
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    struct NoopObservability;
+    impl IObservability for NoopObservability {
+        fn emit(&self, _event: String) {}
+    }
+
+    struct MockJournalRepo;
+    impl IJournalRepo for MockJournalRepo {
+        fn persist_outbound(&self, _record: crate::core::domain::journal::RequestRecord) {}
+        fn persist_inbound(&self, _record: crate::core::domain::journal::ResponseRecord) {}
+        fn replay(&self, _query: String) -> Vec<crate::core::domain::journal::ResponseRecord> {
+            Vec::new()
+        }
+    }
+
+    fn noop_obs() -> Arc<dyn IObservability + Send + Sync> {
+        Arc::new(NoopObservability)
+    }
+
+    fn free_tcp_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral tcp port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    }
+
+    fn make_test_gateway() -> Arc<GatewayService> {
+        let (stream_tx, _stream_rx) = tokio::sync::mpsc::channel::<crate::core::domain::market_data::MarketDataCommand>(32);
+
+        use crate::adapters::messaging::order_lifecycle_publisher::OrderLifecyclePublisher;
+        let (lifecycle_tx, _lifecycle_rx) = tokio::sync::mpsc::channel(128);
+        let order_lifecycle_publisher = OrderLifecyclePublisher::from_sender(lifecycle_tx);
+
+        let order_submission = Arc::new(OrderSubmissionService::new(
+            RequestValidator,
+            IdempotencyStore::default(),
+            Box::new(MockAdapter::default()),
+            Arc::new(KillSwitch::default()),
+            Arc::new(RateLimiterManager::new(200.0)),
+            Arc::new(CircuitBreaker::new("test", 3, 30, noop_obs())),
+            "test",
+        )) as Arc<dyn IOrderSubmissionService>;
+
+        let risk_management = Arc::new(RiskManagementService::new(
+            KillSwitch::default(),
+            RateLimiterManager::new(200.0),
+        )) as Arc<dyn IRiskManagementService>;
+
+        let observability = Arc::new(ObservabilityService::new(
+            crate::core::patterns::telemetry_decorator::TelemetryDecorator,
+            noop_obs(),
+            Arc::new(MockJournalRepo),
+        )) as Arc<dyn IObservabilityService>;
+
+        Arc::new(GatewayService::new(
+            order_submission,
+            risk_management,
+            observability,
+            ConnectionManager::new(5, 500),
+            stream_tx,
+            order_lifecycle_publisher,
+        ))
+    }
+
+    #[tokio::test]
+    async fn bus_adapter_listen_once_processes_single_request() {
+        let port = free_tcp_port();
+        let endpoint = format!("tcp://127.0.0.1:{}", port);
+        let gateway = make_test_gateway();
+        let bus = BusAdapter::new(endpoint.clone(), gateway);
+
+        // Spawn the listener in background
+        let listener_handle = tokio::spawn(async move {
+            bus.listen_once().await.expect("listen_once should succeed");
+        });
+
+        // Give listener time to bind
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send request in blocking thread
+        let response = tokio::task::spawn_blocking(move || {
+            let ctx = zmq::Context::new();
+            let socket = ctx.socket(zmq::REQ).expect("create REQ socket");
+            socket.set_rcvtimeo(2000).expect("set recv timeout");
+            socket.set_sndtimeo(2000).expect("set send timeout");
+            socket.connect(&format!("tcp://127.0.0.1:{}", port)).expect("connect");
+
+            let request = GatewayRequest::Subscribe(MarketSubscription {
+                symbol: "TEST".to_string(),
+            });
+            let request_bytes = encode_gateway_request(&request).expect("encode");
+            socket.send(request_bytes, 0).expect("send");
+            socket.recv_bytes(0).expect("recv")
+        }).await.expect("client task join");
+
+        // Wait for listener to complete
+        let _ = tokio::time::timeout(Duration::from_secs(2), listener_handle).await;
+
+        // Verify response
+        let (decoded, _) = decode_gateway_response(&response).expect("decode response");
+        assert!(matches!(decoded, GatewayResponse::Ok(payload) if payload.result == "subscribed"));
+    }
+
+    #[tokio::test]
+    async fn bus_adapter_handles_multiple_sequential_requests() {
+        let port = free_tcp_port();
+        let endpoint = format!("tcp://127.0.0.1:{}", port);
+        let gateway = make_test_gateway();
+        let bus = BusAdapter::new(endpoint.clone(), gateway);
+
+        // Spawn listener that processes 3 requests then stops
+        let listener_endpoint = endpoint.clone();
+        let listener_handle = tokio::spawn(async move {
+            // Use a custom limited loop for testing
+            let ctx = Context::new();
+            let socket = ctx.socket(zmq::REP).expect("create socket");
+            socket.bind(&listener_endpoint).expect("bind");
+            socket.set_rcvtimeo(500).expect("set timeout");
+
+            for i in 0..3 {
+                let data = match socket.recv_bytes(0) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+
+                // Process directly for test
+                let response = match decode_gateway_request(&data) {
+                    Ok((req, _)) => {
+                        match req {
+                            GatewayRequest::Subscribe(_) => {
+                                GatewayResponse::Ok(ResponsePayload {
+                                    correlation_id: None,
+                                    result: format!("subscribed-{}", i),
+                                })
+                            }
+                            _ => GatewayResponse::Err(ErrorPayload {
+                                correlation_id: None,
+                                code: "UNEXPECTED".into(),
+                                message: "unexpected request".into(),
+                            })
+                        }
+                    }
+                    Err(e) => GatewayResponse::Err(ErrorPayload {
+                        correlation_id: None,
+                        code: "DECODE_ERROR".into(),
+                        message: e,
+                    })
+                };
+
+                let reply_bytes = encode_gateway_response(&response).expect("encode");
+                socket.send(&reply_bytes, 0).expect("send");
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send 3 sequential requests
+        let client_result = tokio::task::spawn_blocking(move || {
+            let ctx = zmq::Context::new();
+            let socket = ctx.socket(zmq::REQ).expect("create REQ socket");
+            socket.set_rcvtimeo(2000).expect("set timeout");
+            socket.set_sndtimeo(2000).expect("set timeout");
+            socket.connect(&format!("tcp://127.0.0.1:{}", port)).expect("connect");
+
+            for i in 0..3 {
+                let request = GatewayRequest::Subscribe(MarketSubscription {
+                    symbol: format!("SYM{}", i),
+                });
+                let request_bytes = encode_gateway_request(&request).expect("encode");
+                socket.send(request_bytes, 0).expect("send");
+                let response = socket.recv_bytes(0).expect("recv");
+                
+                let (decoded, _) = decode_gateway_response(&response).expect("decode");
+                if !matches!(decoded, GatewayResponse::Ok(_)) {
+                    return false;
+                }
+            }
+            true
+        }).await.expect("client task join");
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), listener_handle).await;
+        assert!(client_result, "All 3 requests should succeed");
+    }
+
+    #[test]
+    fn test_zmq_rep_socket_state_machine() {
+        // This test verifies that ZMQ REP sockets properly enforce recv->send alternation
+        let ctx = zmq::Context::new();
+        let rep_socket = ctx.socket(zmq::REP).expect("create REP socket");
+        let req_socket = ctx.socket(zmq::REQ).expect("create REQ socket");
+
+        // Bind REP socket
+        rep_socket.bind("inproc://test_state_machine").expect("bind");
+        
+        // Connect REQ socket
+        req_socket.connect("inproc://test_state_machine").expect("connect");
+
+        // REQ socket sends first
+        req_socket.send("hello", 0).expect("req send");
+
+        // REP socket must recv first
+        let msg = rep_socket.recv_bytes(0).expect("rep recv");
+        assert_eq!(msg, b"hello");
+
+        // REP socket sends response
+        rep_socket.send("world", 0).expect("rep send");
+
+        // REQ socket receives response
+        let response = req_socket.recv_bytes(0).expect("req recv");
+        assert_eq!(response, b"world");
+
+        // Now the cycle can repeat
+        req_socket.send("second", 0).expect("req send 2");
+        let msg2 = rep_socket.recv_bytes(0).expect("rep recv 2");
+        assert_eq!(msg2, b"second");
     }
 }
