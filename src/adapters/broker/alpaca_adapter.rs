@@ -11,6 +11,8 @@ use apca::Client;
 use apca::api::v2::order::{
     Create,
     CreateReqInit,
+    Change,
+    ChangeReq,
     Delete,
     Get,
     Side,
@@ -116,29 +118,21 @@ impl IExecutionPort for AlpacaBrokerAdapter {
     async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), Self::Error> {
         let id = Self::parse_order_id(&cmd.execution_id.0)?;
 
-        // apca 0.30 doesn't support PATCH; cancel old order and create new one
+        // Build the change request with only the fields that should be updated
+        let change_req = ChangeReq {
+            quantity: cmd.qty.map(|q| Num::from(q)),
+            limit_price: cmd.limit_price.and_then(|p| Num::from_str(&p.to_string()).ok()),
+            ..Default::default()
+        };
+
+        // Use the native PATCH endpoint for atomic order replacement
+        // This updates the order in-place without canceling and recreating
+        let change_input = (id, change_req);
+        
         self.client
-            .issue::<Delete>(&id)
+            .issue::<Change>(&change_input)
             .await
-            .map_err(|e| BrokerError::Unknown(format!("replace: cancel failed: {}", e)))?;
-
-        // For now, we can only create a Buy order since ReplaceCmd doesn't specify side
-        // In a real system, you'd want to extend ReplaceCmd to include side and other params
-        let limit_price = cmd.limit_price
-            .and_then(|p| Num::from_str(&p.to_string()).ok());
-
-        if let Some(qty) = cmd.qty {
-            let req = CreateReqInit {
-                limit_price,
-                ..Default::default()
-            }
-            .init(&cmd.symbol, Side::Buy, Amount::quantity(qty));
-
-            self.client
-                .issue::<Create>(&req)
-                .await
-                .map_err(|e| BrokerError::Unknown(format!("replace: create failed: {}", e)))?;
-        }
+            .map_err(|e| BrokerError::Unknown(format!("replace failed: {}", e)))?;
 
         Ok(())
     }

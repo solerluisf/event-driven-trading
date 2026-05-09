@@ -1,4 +1,11 @@
 // src/tests/mod.rs
+//
+// Test module for broker_gateway_service
+// 
+// Windows Note: Tests are configured to run sequentially to avoid
+// file lock issues (LNK1104) common on Windows with MSVC linker.
+// Use `cargo test -- --test-threads=1` or the provided `test-windows.bat`
+// script to run tests properly on Windows.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -828,5 +835,376 @@ mod subscription_tests {
 
         assert!(matches!(cmd1, MarketDataCommand::Subscribe(s) if s.symbol == "MSFT"));
         assert!(matches!(cmd2, MarketDataCommand::Unsubscribe(s) if s.symbol == "MSFT"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ReplaceOrder Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod replace_order_tests {
+    use crate::core::domain::order::{ReplaceCmd, ExecutionId, OrderSide};
+    use crate::adapters::broker::mock_adapter::MockAdapter;
+    use crate::core::ports::execution_port::IExecutionPort;
+
+    /// Helper to create a ReplaceCmd for tests
+    fn make_replace_cmd(
+        execution_id: &str,
+        symbol: &str,
+        side: OrderSide,
+        qty: Option<u32>,
+        limit_price: Option<f64>,
+    ) -> ReplaceCmd {
+        ReplaceCmd {
+            execution_id: ExecutionId(execution_id.to_string()),
+            symbol: symbol.to_string(),
+            side,
+            qty,
+            limit_price,
+        }
+    }
+
+    #[test]
+    fn replace_cmd_serialization_with_all_fields() {
+        let cmd = make_replace_cmd(
+            "exec-123",
+            "AAPL",
+            OrderSide::Buy,
+            Some(100),
+            Some(182.50),
+        );
+
+        let json = serde_json::to_string(&cmd).expect("should serialize");
+        assert!(json.contains("\"execution_id\":\"exec-123\""));
+        assert!(json.contains("\"symbol\":\"AAPL\""));
+        assert!(json.contains("\"side\":\"Buy\""));
+        assert!(json.contains("\"qty\":100"));
+        assert!(json.contains("\"limit_price\":182.5"));
+    }
+
+    #[test]
+    fn replace_cmd_serialization_with_sell_side() {
+        let cmd = make_replace_cmd(
+            "exec-456",
+            "TSLA",
+            OrderSide::Sell,
+            Some(50),
+            Some(250.0),
+        );
+
+        let json = serde_json::to_string(&cmd).expect("should serialize");
+        assert!(json.contains("\"side\":\"Sell\""));
+    }
+
+    #[test]
+    fn replace_cmd_serialization_with_optional_fields_none() {
+        let cmd = ReplaceCmd {
+            execution_id: ExecutionId("exec-789".to_string()),
+            symbol: "SPY".to_string(),
+            side: OrderSide::Buy,
+            qty: None,
+            limit_price: None,
+        };
+
+        let json = serde_json::to_string(&cmd).expect("should serialize");
+        assert!(json.contains("\"qty\":null"));
+        assert!(json.contains("\"limit_price\":null"));
+    }
+
+    #[test]
+    fn replace_cmd_deserialization_from_json() {
+        let json = r#"{
+            "execution_id": "exec-abc",
+            "symbol": "MSFT",
+            "side": "Buy",
+            "qty": 200,
+            "limit_price": 300.0
+        }"#;
+
+        let cmd: ReplaceCmd = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(cmd.execution_id.0, "exec-abc");
+        assert_eq!(cmd.symbol, "MSFT");
+        assert_eq!(cmd.side, OrderSide::Buy);
+        assert_eq!(cmd.qty, Some(200));
+        assert_eq!(cmd.limit_price, Some(300.0));
+    }
+
+    #[test]
+    fn replace_cmd_deserialization_with_sell_side() {
+        let json = r#"{
+            "execution_id": "exec-def",
+            "symbol": "GOOGL",
+            "side": "Sell",
+            "qty": 10,
+            "limit_price": 140.0
+        }"#;
+
+        let cmd: ReplaceCmd = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(cmd.side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn replace_cmd_deserialization_with_null_fields() {
+        let json = r#"{
+            "execution_id": "exec-ghi",
+            "symbol": "AMZN",
+            "side": "Buy",
+            "qty": null,
+            "limit_price": null
+        }"#;
+
+        let cmd: ReplaceCmd = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(cmd.qty, None);
+        assert_eq!(cmd.limit_price, None);
+    }
+
+    #[test]
+    fn replace_cmd_roundtrip_serialization() {
+        let original = make_replace_cmd(
+            "exec-roundtrip",
+            "NVDA",
+            OrderSide::Sell,
+            Some(25),
+            Some(450.75),
+        );
+
+        let json = serde_json::to_string(&original).expect("should serialize");
+        let deserialized: ReplaceCmd = serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(original.execution_id.0, deserialized.execution_id.0);
+        assert_eq!(original.symbol, deserialized.symbol);
+        assert_eq!(original.side, deserialized.side);
+        assert_eq!(original.qty, deserialized.qty);
+        assert_eq!(original.limit_price, deserialized.limit_price);
+    }
+
+    #[test]
+    fn replace_cmd_clone() {
+        let cmd = make_replace_cmd(
+            "exec-clone",
+            "META",
+            OrderSide::Buy,
+            Some(75),
+            Some(320.0),
+        );
+
+        let cloned = cmd.clone();
+        assert_eq!(cmd.execution_id.0, cloned.execution_id.0);
+        assert_eq!(cmd.symbol, cloned.symbol);
+        assert_eq!(cmd.side, cloned.side);
+        assert_eq!(cmd.qty, cloned.qty);
+        assert_eq!(cmd.limit_price, cloned.limit_price);
+    }
+
+    #[test]
+    fn replace_cmd_debug_format() {
+        let cmd = make_replace_cmd(
+            "exec-debug",
+            "NFLX",
+            OrderSide::Sell,
+            Some(30),
+            Some(500.0),
+        );
+
+        let debug_str = format!("{:?}", cmd);
+        assert!(debug_str.contains("exec-debug"));
+        assert!(debug_str.contains("NFLX"));
+        assert!(debug_str.contains("Sell"));
+    }
+
+    #[tokio::test]
+    async fn mock_adapter_replace_order_succeeds() {
+        let adapter = MockAdapter::default();
+        let cmd = make_replace_cmd(
+            "exec-mock-123",
+            "AAPL",
+            OrderSide::Buy,
+            Some(100),
+            Some(180.0),
+        );
+
+        let result = adapter.replace_order(cmd).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_adapter_replace_order_with_sell_side_succeeds() {
+        let adapter = MockAdapter::default();
+        let cmd = make_replace_cmd(
+            "exec-mock-456",
+            "TSLA",
+            OrderSide::Sell,
+            Some(50),
+            Some(250.0),
+        );
+
+        let result = adapter.replace_order(cmd).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_adapter_replace_order_with_optional_fields_none_succeeds() {
+        let adapter = MockAdapter::default();
+        let cmd = ReplaceCmd {
+            execution_id: ExecutionId("exec-mock-789".to_string()),
+            symbol: "SPY".to_string(),
+            side: OrderSide::Buy,
+            qty: None,
+            limit_price: None,
+        };
+
+        let result = adapter.replace_order(cmd).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn replace_cmd_equality() {
+        let cmd1 = make_replace_cmd(
+            "exec-same",
+            "AAPL",
+            OrderSide::Buy,
+            Some(100),
+            Some(180.0),
+        );
+        let cmd2 = make_replace_cmd(
+            "exec-same",
+            "AAPL",
+            OrderSide::Buy,
+            Some(100),
+            Some(180.0),
+        );
+        let cmd3 = make_replace_cmd(
+            "exec-different",
+            "AAPL",
+            OrderSide::Buy,
+            Some(100),
+            Some(180.0),
+        );
+
+        assert_eq!(cmd1, cmd2);
+        assert_ne!(cmd1, cmd3);
+    }
+
+    #[test]
+    fn replace_cmd_different_sides_not_equal() {
+        let buy_cmd = make_replace_cmd(
+            "exec-side",
+            "AAPL",
+            OrderSide::Buy,
+            Some(100),
+            Some(180.0),
+        );
+        let sell_cmd = make_replace_cmd(
+            "exec-side",
+            "AAPL",
+            OrderSide::Sell,
+            Some(100),
+            Some(180.0),
+        );
+
+        assert_ne!(buy_cmd, sell_cmd);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ReplaceOrder Wire Message Tests (JSON over ZeroMQ)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod replace_order_wire_tests {
+    use crate::core::domain::order::{ReplaceCmd, ExecutionId, OrderSide};
+    use crate::core::domain::wire_message::GatewayRequest;
+
+    #[test]
+    fn gateway_request_replace_order_deserialization() {
+        let json = r#"{
+            "command": "replace_order",
+            "payload": {
+                "execution_id": "exec-wire-123",
+                "symbol": "AAPL",
+                "side": "Buy",
+                "qty": 100,
+                "limit_price": 182.50
+            }
+        }"#;
+
+        let request: GatewayRequest = serde_json::from_str(json).expect("should deserialize");
+        
+        match request {
+            GatewayRequest::ReplaceOrder(cmd) => {
+                assert_eq!(cmd.execution_id.0, "exec-wire-123");
+                assert_eq!(cmd.symbol, "AAPL");
+                assert_eq!(cmd.side, OrderSide::Buy);
+                assert_eq!(cmd.qty, Some(100));
+                assert_eq!(cmd.limit_price, Some(182.50));
+            }
+            _ => panic!("Expected ReplaceOrder variant"),
+        }
+    }
+
+    #[test]
+    fn gateway_request_replace_order_with_sell_side_deserialization() {
+        let json = r#"{
+            "command": "replace_order",
+            "payload": {
+                "execution_id": "exec-wire-456",
+                "symbol": "TSLA",
+                "side": "Sell",
+                "qty": 50,
+                "limit_price": 250.0
+            }
+        }"#;
+
+        let request: GatewayRequest = serde_json::from_str(json).expect("should deserialize");
+        
+        match request {
+            GatewayRequest::ReplaceOrder(cmd) => {
+                assert_eq!(cmd.side, OrderSide::Sell);
+            }
+            _ => panic!("Expected ReplaceOrder variant"),
+        }
+    }
+
+    #[test]
+    fn gateway_request_replace_order_with_null_fields() {
+        let json = r#"{
+            "command": "replace_order",
+            "payload": {
+                "execution_id": "exec-wire-789",
+                "symbol": "SPY",
+                "side": "Buy",
+                "qty": null,
+                "limit_price": null
+            }
+        }"#;
+
+        let request: GatewayRequest = serde_json::from_str(json).expect("should deserialize");
+        
+        match request {
+            GatewayRequest::ReplaceOrder(cmd) => {
+                assert_eq!(cmd.execution_id.0, "exec-wire-789");
+                assert_eq!(cmd.qty, None);
+                assert_eq!(cmd.limit_price, None);
+            }
+            _ => panic!("Expected ReplaceOrder variant"),
+        }
+    }
+
+    #[test]
+    fn gateway_request_replace_order_missing_side_fails() {
+        // This test verifies that the side field is now required
+        let json = r#"{
+            "command": "replace_order",
+            "payload": {
+                "execution_id": "exec-wire-000",
+                "symbol": "AAPL",
+                "qty": 100,
+                "limit_price": 180.0
+            }
+        }"#;
+
+        let result: Result<GatewayRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Should fail when side field is missing");
     }
 }

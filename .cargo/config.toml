@@ -1,2 +1,39 @@
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-l", "advapi32"]
+# Use rust-lld linker for faster builds and fewer file lock issues
+linker = "rust-lld.exe"
+rustflags = [
+    "-l", "advapi32",
+    "-l", "kernel32",
+    "-l", "ws2_32",
+    "-l", "userenv",
+    "-l", "ntdll",
+]
+
+# Windows-specific build settings
+[build]
+# Leave commented to use default (number of CPUs)
+# jobs = 4
+
+# Cargo aliases for Windows-friendly commands
+[alias]
+# Windows-safe test command (single-threaded to avoid LNK1104)
+win-test = "test --profile test -- --test-threads=1"
+
+# Windows-safe test with filter
+win-testf = "test --profile test -- --test-threads=1"
+
+# Clean build for Windows (prevents file locks)
+win-build = "build --profile dev"
+
+# Clean and build
+win-rebuild = "clean && build --profile dev"
+
+# Run all tests safely on Windows
+win-test-all = "test --profile test -- --test-threads=1"
+
+# Check (fastest, no linking)
+win-check = "check --profile dev"
+
+# Test specific module on Windows
+# Usage: cargo win-test-mod replace_order
+win-test-mod = "test --profile test -- --test-threads=1"
