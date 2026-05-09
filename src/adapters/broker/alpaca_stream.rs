@@ -569,8 +569,12 @@ pub async fn handle_message_test(
 
     struct NoopObs;
     impl IObservabilityService for NoopObs {
-        fn record_outbound(&self, _record: RequestRecord) {}
-        fn record_inbound(&self, _record: ResponseRecord) {}
+        fn record_outbound(&self, _record: RequestRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
+        fn record_inbound(&self, _record: ResponseRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
         fn emit_event(&self, _event: String) {}
     }
 

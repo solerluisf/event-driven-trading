@@ -721,8 +721,12 @@ mod subscription_tests {
     /// Mock journal repo that does nothing
     struct MockJournalRepo;
     impl IJournalRepo for MockJournalRepo {
-        fn persist_outbound(&self, _record: crate::core::domain::journal::RequestRecord) {}
-        fn persist_inbound(&self, _record: crate::core::domain::journal::ResponseRecord) {}
+        fn persist_outbound(&self, _record: crate::core::domain::journal::RequestRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
+        fn persist_inbound(&self, _record: crate::core::domain::journal::ResponseRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
         fn replay(&self, _query: String) -> Vec<crate::core::domain::journal::ResponseRecord> {
             Vec::new()
         }

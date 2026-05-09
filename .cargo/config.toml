@@ -1,3 +1,10 @@
+# Build configuration
+[build]
+# Ensure consistent target directory (prevents target2, target_backup, etc.)
+target-dir = "target"
+# Leave commented to use default (number of CPUs)
+# jobs = 4
+
 [target.x86_64-pc-windows-msvc]
 # Use rust-lld linker for faster builds and fewer file lock issues
 linker = "rust-lld.exe"
@@ -8,11 +15,6 @@ rustflags = [
     "-l", "userenv",
     "-l", "ntdll",
 ]
-
-# Windows-specific build settings
-[build]
-# Leave commented to use default (number of CPUs)
-# jobs = 4
 
 # Cargo aliases for Windows-friendly commands
 [alias]

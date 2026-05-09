@@ -27,7 +27,25 @@ pub trait IRiskManagementService: Send + Sync {
 
 /// Records outbound commands and inbound confirmations.
 pub trait IObservabilityService: Send + Sync {
-    fn record_outbound(&self, record: RequestRecord);
-    fn record_inbound(&self, record: ResponseRecord);
+    /// Record an outbound request to the journal.
+    /// 
+    /// # Returns
+    /// - Ok(()) if the record was successfully persisted to disk
+    /// - Err(JournalError) if persistence failed
+    /// 
+    /// # Durability Guarantee
+    /// Implementations must ensure the data is fsync'd to disk before returning Ok.
+    fn record_outbound(&self, record: RequestRecord) -> crate::core::ports::journal_repo::JournalResult<()>;
+    
+    /// Record an inbound response to the journal.
+    /// 
+    /// # Returns
+    /// - Ok(()) if the record was successfully persisted to disk
+    /// - Err(JournalError) if persistence failed
+    /// 
+    /// # Durability Guarantee
+    /// Implementations must ensure the data is fsync'd to disk before returning Ok.
+    fn record_inbound(&self, record: ResponseRecord) -> crate::core::ports::journal_repo::JournalResult<()>;
+    
     fn emit_event(&self, event: String);
 }

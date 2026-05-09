@@ -193,8 +193,12 @@ mod tests {
     struct TestObservability;
 
     impl IObservabilityService for TestObservability {
-        fn record_outbound(&self, _record: crate::core::domain::journal::RequestRecord) {}
-        fn record_inbound(&self, _record: crate::core::domain::journal::ResponseRecord) {}
+        fn record_outbound(&self, _record: crate::core::domain::journal::RequestRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
+        fn record_inbound(&self, _record: crate::core::domain::journal::ResponseRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
         fn emit_event(&self, _event: String) {}
     }
 

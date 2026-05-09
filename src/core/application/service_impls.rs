@@ -55,11 +55,11 @@ impl IRiskManagementService for RiskManagementService {
 // ── ObservabilityService ──────────────────────────────────────────────────────
 
 impl IObservabilityService for ObservabilityService {
-    fn record_outbound(&self, record: RequestRecord) {
-        self.record_outbound(record);
+    fn record_outbound(&self, record: RequestRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+        self.record_outbound(record)
     }
-    fn record_inbound(&self, record: ResponseRecord) {
-        self.record_inbound(record);
+    fn record_inbound(&self, record: ResponseRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+        self.record_inbound(record)
     }
     fn emit_event(&self, event: String) {
         self.emit_event(event);

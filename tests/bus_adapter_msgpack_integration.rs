@@ -34,8 +34,12 @@ impl IObservability for NoopObservability {
 
 struct MockJournalRepo;
 impl IJournalRepo for MockJournalRepo {
-    fn persist_outbound(&self, _record: broker_gateway_service::core::domain::journal::RequestRecord) {}
-    fn persist_inbound(&self, _record: broker_gateway_service::core::domain::journal::ResponseRecord) {}
+    fn persist_outbound(&self, _record: broker_gateway_service::core::domain::journal::RequestRecord) -> broker_gateway_service::core::ports::journal_repo::JournalResult<()> {
+        Ok(())
+    }
+    fn persist_inbound(&self, _record: broker_gateway_service::core::domain::journal::ResponseRecord) -> broker_gateway_service::core::ports::journal_repo::JournalResult<()> {
+        Ok(())
+    }
     fn replay(&self, _query: String) -> Vec<broker_gateway_service::core::domain::journal::ResponseRecord> {
         Vec::new()
     }

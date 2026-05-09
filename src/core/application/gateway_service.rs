@@ -52,11 +52,15 @@ impl GatewayService {
         // Risk check (kill switch + rate limit) before anything else
         self.risk_management.check(&cmd.symbol, 1)?;
 
-        // Journal the outbound intent
-        self.observability.record_outbound(RequestRecord {
+        // Journal the outbound intent BEFORE executing.
+        // This is critical: if we can't journal the intent, we must not execute.
+        if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: cmd.symbol.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
-        });
+        }) {
+            tracing::error!("CRITICAL: Failed to journal outbound request - refusing to execute. Error: {}", e);
+            return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
+        }
 
         // Submit
         let execution_id = self.order_submission.submit_order(cmd.clone()).await?;
@@ -74,21 +78,32 @@ impl GatewayService {
             tracing::warn!("failed to publish order submitted event: {}", e);
         }
 
-        // Journal the inbound confirmation
-        self.observability.record_inbound(ResponseRecord {
+        // Journal the inbound confirmation BEFORE returning success.
+        // This ensures we can always reconcile what the broker told us.
+        if let Err(e) = self.observability.record_inbound(ResponseRecord {
             id: execution_id.0.clone(),
             raw_payload: None,
-        });
+        }) {
+            tracing::error!("CRITICAL: Failed to journal inbound confirmation for execution_id={}. Error: {}", execution_id.0, e);
+            // Note: We don't fail the operation here because the broker has already executed.
+            // But we log it prominently for manual reconciliation.
+        }
 
         Ok(execution_id)
     }
 
     pub async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), BrokerError> {
         self.risk_management.check(&cmd.execution_id.0, 1)?;
-        self.observability.record_outbound(RequestRecord {
+        
+        // Journal the outbound intent BEFORE executing
+        if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: cmd.execution_id.0.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
-        });
+        }) {
+            tracing::error!("CRITICAL: Failed to journal outbound cancel request - refusing to execute. Error: {}", e);
+            return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
+        }
+        
         let exec_id = cmd.execution_id.0.clone();
         
         match self.order_submission.cancel_order(cmd).await {
@@ -110,10 +125,16 @@ impl GatewayService {
 
     pub async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), BrokerError> {
         self.risk_management.check(&cmd.execution_id.0, 1)?;
-        self.observability.record_outbound(RequestRecord {
+        
+        // Journal the outbound intent BEFORE executing
+        if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: cmd.execution_id.0.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
-        });
+        }) {
+            tracing::error!("CRITICAL: Failed to journal outbound replace request - refusing to execute. Error: {}", e);
+            return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
+        }
+        
         let exec_id = cmd.execution_id.0.clone();
         let symbol = cmd.symbol.clone();
         
@@ -147,10 +168,14 @@ impl GatewayService {
     }
 
     pub async fn subscribe(&self, sub: MarketSubscription) -> Result<(), BrokerError> {
-        self.observability.record_outbound(RequestRecord {
+        // Journal the outbound intent BEFORE executing
+        if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: sub.symbol.clone(),
             raw_payload: serde_json::to_string(&sub).ok(),
-        });
+        }) {
+            tracing::error!("CRITICAL: Failed to journal outbound subscribe request - refusing to execute. Error: {}", e);
+            return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
+        }
 
         self.stream_command_tx
             .send(MarketDataCommand::Subscribe(sub))
@@ -159,10 +184,14 @@ impl GatewayService {
     }
 
     pub async fn unsubscribe(&self, sub: MarketSubscription) -> Result<(), BrokerError> {
-        self.observability.record_outbound(RequestRecord {
+        // Journal the outbound intent BEFORE executing
+        if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: sub.symbol.clone(),
             raw_payload: serde_json::to_string(&sub).ok(),
-        });
+        }) {
+            tracing::error!("CRITICAL: Failed to journal outbound unsubscribe request - refusing to execute. Error: {}", e);
+            return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
+        }
 
         self.stream_command_tx
             .send(MarketDataCommand::Unsubscribe(sub))
