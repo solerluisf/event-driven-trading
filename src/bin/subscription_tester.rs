@@ -38,6 +38,7 @@ async fn main() {
     println!("\n--- Test 1: Subscribe to TSLA ---");
     let subscribe_tsla = GatewayRequest::Subscribe(MarketSubscription {
         symbol: "TSLA".into(),
+        correlation_id: Some("corr-tsla-sub".into()),
     });
 
     let response = send_and_recv(&socket, &subscribe_tsla).await;
@@ -47,6 +48,7 @@ async fn main() {
     println!("\n--- Test 2: Subscribe to GOOGL ---");
     let subscribe_googl = GatewayRequest::Subscribe(MarketSubscription {
         symbol: "GOOGL".into(),
+        correlation_id: Some("corr-googl-sub".into()),
     });
 
     let response = send_and_recv(&socket, &subscribe_googl).await;
@@ -56,6 +58,7 @@ async fn main() {
     println!("\n--- Test 3: Unsubscribe from TSLA ---");
     let unsubscribe_tsla = GatewayRequest::Unsubscribe(MarketSubscription {
         symbol: "TSLA".into(),
+        correlation_id: Some("corr-tsla-unsub".into()),
     });
 
     let response = send_and_recv(&socket, &unsubscribe_tsla).await;
@@ -65,6 +68,7 @@ async fn main() {
     println!("\n--- Test 4: Subscribe to MSFT ---");
     let subscribe_msft = GatewayRequest::Subscribe(MarketSubscription {
         symbol: "MSFT".into(),
+        correlation_id: Some("corr-msft-sub".into()),
     });
 
     let response = send_and_recv(&socket, &subscribe_msft).await;

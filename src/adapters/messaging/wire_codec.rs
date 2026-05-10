@@ -107,6 +107,7 @@ mod tests {
     fn gateway_request_round_trip_msgpack() {
         let req = GatewayRequest::Subscribe(MarketSubscription {
             symbol: "AAPL".to_string(),
+            correlation_id: Some("corr-wire-001".into()),
         });
 
         let encoded = encode_gateway_request(&req).expect("encode should succeed");
@@ -165,6 +166,7 @@ mod tests {
         // JSON payloads should be rejected - only MessagePack is supported
         let json_bytes = serde_json::to_vec(&GatewayRequest::Subscribe(MarketSubscription {
             symbol: "TSLA".to_string(),
+            correlation_id: Some("corr-wire-002".into()),
         }))
         .expect("json serialize should succeed");
 

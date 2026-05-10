@@ -60,7 +60,10 @@ impl OrderSubmissionService {
         self.kill_switch.register_cancel_callback(move |exec_id| {
             tracing::error!("🚨 Kill switch triggering cancel for order: {}", exec_id.0);
             
-            let cancel_cmd = CancelCmd { execution_id: exec_id };
+            let cancel_cmd = CancelCmd { 
+                execution_id: exec_id,
+                correlation_id: Some("kill_switch".to_string()),
+            };
             
             // Execute cancel - we can't use .await here since we're in a sync callback
             // In production, this should spawn a task to cancel the order

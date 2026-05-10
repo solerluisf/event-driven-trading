@@ -57,6 +57,7 @@ impl GatewayService {
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: cmd.symbol.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
+            correlation_id: cmd.correlation_id.clone().or_else(|| cmd.client_order_id.clone()),
         }) {
             tracing::error!("CRITICAL: Failed to journal outbound request - refusing to execute. Error: {}", e);
             return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
@@ -83,6 +84,7 @@ impl GatewayService {
         if let Err(e) = self.observability.record_inbound(ResponseRecord {
             id: execution_id.0.clone(),
             raw_payload: None,
+            correlation_id: cmd.correlation_id.clone().or_else(|| cmd.client_order_id.clone()),
         }) {
             tracing::error!("CRITICAL: Failed to journal inbound confirmation for execution_id={}. Error: {}", execution_id.0, e);
             // Note: We don't fail the operation here because the broker has already executed.
@@ -99,6 +101,7 @@ impl GatewayService {
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: cmd.execution_id.0.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
+            correlation_id: cmd.correlation_id.clone().or_else(|| Some(cmd.execution_id.0.clone())),
         }) {
             tracing::error!("CRITICAL: Failed to journal outbound cancel request - refusing to execute. Error: {}", e);
             return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
@@ -130,6 +133,7 @@ impl GatewayService {
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: cmd.execution_id.0.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
+            correlation_id: cmd.correlation_id.clone().or_else(|| Some(cmd.execution_id.0.clone())),
         }) {
             tracing::error!("CRITICAL: Failed to journal outbound replace request - refusing to execute. Error: {}", e);
             return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
@@ -164,7 +168,30 @@ impl GatewayService {
     }
 
     pub async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
-        self.order_submission.query_status(query).await
+        // Note: query_status is a read-only operation, but we still track it for observability
+        if let Err(e) = self.observability.record_outbound(RequestRecord {
+            id: query.execution_id.0.clone(),
+            raw_payload: serde_json::to_string(&query).ok(),
+            correlation_id: query.correlation_id.clone().or_else(|| Some(query.execution_id.0.clone())),
+        }) {
+            tracing::warn!("Failed to journal outbound query_status request: {}", e);
+            // Don't fail the operation for query_status since it's read-only
+        }
+        
+        let result = self.order_submission.query_status(query.clone()).await;
+        
+        // Journal the response
+        if let Ok(ref status_response) = result {
+            if let Err(e) = self.observability.record_inbound(ResponseRecord {
+                id: query.execution_id.0.clone(),
+                raw_payload: serde_json::to_string(status_response).ok(),
+                correlation_id: query.correlation_id.clone().or_else(|| Some(query.execution_id.0.clone())),
+            }) {
+                tracing::warn!("Failed to journal inbound query_status response: {}", e);
+            }
+        }
+        
+        result
     }
 
     pub async fn subscribe(&self, sub: MarketSubscription) -> Result<(), BrokerError> {
@@ -172,6 +199,7 @@ impl GatewayService {
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: sub.symbol.clone(),
             raw_payload: serde_json::to_string(&sub).ok(),
+            correlation_id: sub.correlation_id.clone().or_else(|| Some(sub.symbol.clone())),
         }) {
             tracing::error!("CRITICAL: Failed to journal outbound subscribe request - refusing to execute. Error: {}", e);
             return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
@@ -188,6 +216,7 @@ impl GatewayService {
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: sub.symbol.clone(),
             raw_payload: serde_json::to_string(&sub).ok(),
+            correlation_id: sub.correlation_id.clone().or_else(|| Some(sub.symbol.clone())),
         }) {
             tracing::error!("CRITICAL: Failed to journal outbound unsubscribe request - refusing to execute. Error: {}", e);
             return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));

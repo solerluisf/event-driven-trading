@@ -276,7 +276,8 @@ impl BusAdapter {
     async fn dispatch(&self, req: GatewayRequest, gateway: &GatewayService) -> GatewayResponse {
         match req {
             GatewayRequest::SubmitOrder(cmd) => {
-                let correlation_id = cmd.client_order_id.clone();
+                // Use explicit correlation_id if provided, fall back to client_order_id
+                let correlation_id = cmd.correlation_id.clone().or_else(|| cmd.client_order_id.clone());
                 match gateway.submit_order(cmd).await {
                     Ok(exec_id) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
@@ -291,7 +292,8 @@ impl BusAdapter {
             }
 
             GatewayRequest::CancelOrder(cmd) => {
-                let correlation_id = Some(cmd.execution_id.0.clone());
+                // Use explicit correlation_id if provided, fall back to execution_id
+                let correlation_id = cmd.correlation_id.clone().or_else(|| Some(cmd.execution_id.0.clone()));
                 match gateway.cancel_order(cmd).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
@@ -306,7 +308,8 @@ impl BusAdapter {
             }
 
             GatewayRequest::ReplaceOrder(cmd) => {
-                let correlation_id = Some(cmd.execution_id.0.clone());
+                // Use explicit correlation_id if provided, fall back to execution_id
+                let correlation_id = cmd.correlation_id.clone().or_else(|| Some(cmd.execution_id.0.clone()));
                 match gateway.replace_order(cmd).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
@@ -321,7 +324,8 @@ impl BusAdapter {
             }
 
             GatewayRequest::QueryStatus(query) => {
-                let correlation_id = Some(query.execution_id.0.clone());
+                // Use explicit correlation_id if provided, fall back to execution_id
+                let correlation_id = query.correlation_id.clone().or_else(|| Some(query.execution_id.0.clone()));
                 match gateway.query_status(query).await {
                     Ok(status_response) => {
                         // Serialize the order status response as JSON
@@ -341,7 +345,8 @@ impl BusAdapter {
             }
 
             GatewayRequest::Subscribe(sub) => {
-                let correlation_id = Some(sub.symbol.clone());
+                // Use explicit correlation_id if provided, fall back to symbol
+                let correlation_id = sub.correlation_id.clone().or_else(|| Some(sub.symbol.clone()));
                 match gateway.subscribe(sub).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
@@ -356,7 +361,8 @@ impl BusAdapter {
             }
 
             GatewayRequest::Unsubscribe(sub) => {
-                let correlation_id = Some(sub.symbol.clone());
+                // Use explicit correlation_id if provided, fall back to symbol
+                let correlation_id = sub.correlation_id.clone().or_else(|| Some(sub.symbol.clone()));
                 match gateway.unsubscribe(sub).await {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
@@ -538,6 +544,7 @@ mod tests {
             client_order_id: Some("test-123".to_string()),
             extended_hours: false,
             notional: None,
+            correlation_id: Some("corr-test-001".to_string()),
         });
         assert_eq!(CommandPriority::for_request(&req), CommandPriority::Critical);
         assert!(CommandPriority::for_request(&req).is_synchronous());
@@ -547,6 +554,7 @@ mod tests {
     fn test_cancel_order_is_critical_priority() {
         let req = GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("exec-123".to_string()),
+            correlation_id: Some("corr-cancel-001".to_string()),
         });
         assert_eq!(CommandPriority::for_request(&req), CommandPriority::Critical);
         assert!(CommandPriority::for_request(&req).is_synchronous());
@@ -560,6 +568,7 @@ mod tests {
             side: OrderSide::Buy,
             qty: Some(200),
             limit_price: Some(150.0),
+            correlation_id: Some("corr-replace-001".to_string()),
         });
         assert_eq!(CommandPriority::for_request(&req), CommandPriority::Critical);
         assert!(CommandPriority::for_request(&req).is_synchronous());
@@ -569,6 +578,7 @@ mod tests {
     fn test_query_status_is_normal_priority() {
         let req = GatewayRequest::QueryStatus(StatusQuery {
             execution_id: ExecutionId("exec-123".to_string()),
+            correlation_id: Some("corr-query-001".to_string()),
         });
         assert_eq!(CommandPriority::for_request(&req), CommandPriority::Normal);
         assert!(!CommandPriority::for_request(&req).is_synchronous());
@@ -578,6 +588,7 @@ mod tests {
     fn test_subscribe_is_low_priority() {
         let req = GatewayRequest::Subscribe(MarketSubscription {
             symbol: "AAPL".to_string(),
+            correlation_id: Some("corr-sub-001".to_string()),
         });
         assert_eq!(CommandPriority::for_request(&req), CommandPriority::Low);
         assert!(!CommandPriority::for_request(&req).is_synchronous());
@@ -587,6 +598,7 @@ mod tests {
     fn test_unsubscribe_is_low_priority() {
         let req = GatewayRequest::Unsubscribe(MarketSubscription {
             symbol: "AAPL".to_string(),
+            correlation_id: Some("corr-unsub-001".to_string()),
         });
         assert_eq!(CommandPriority::for_request(&req), CommandPriority::Low);
         assert!(!CommandPriority::for_request(&req).is_synchronous());
@@ -637,9 +649,11 @@ mod tests {
             client_order_id: None,
             extended_hours: false,
             notional: None,
+            correlation_id: Some("corr-test-002".to_string()),
         });
         let cancel = GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("test".to_string()),
+            correlation_id: Some("corr-test-003".to_string()),
         });
         let replace = GatewayRequest::ReplaceOrder(ReplaceCmd {
             execution_id: ExecutionId("test".to_string()),
@@ -647,6 +661,7 @@ mod tests {
             side: OrderSide::Sell,
             qty: None,
             limit_price: None,
+            correlation_id: Some("corr-test-004".to_string()),
         });
 
         assert!(CommandPriority::for_request(&submit).is_synchronous());
@@ -659,12 +674,15 @@ mod tests {
         // Verify non-execution commands are NOT synchronous
         let query = GatewayRequest::QueryStatus(StatusQuery {
             execution_id: ExecutionId("test".to_string()),
+            correlation_id: Some("corr-test-005".to_string()),
         });
         let subscribe = GatewayRequest::Subscribe(MarketSubscription {
             symbol: "TEST".to_string(),
+            correlation_id: Some("corr-test-006".to_string()),
         });
         let unsubscribe = GatewayRequest::Unsubscribe(MarketSubscription {
             symbol: "TEST".to_string(),
+            correlation_id: Some("corr-test-007".to_string()),
         });
 
         assert!(!CommandPriority::for_request(&query).is_synchronous());

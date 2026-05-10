@@ -222,6 +222,7 @@ mod tests {
         ResponseRecord {
             id: id.to_string(),
             raw_payload: Some(format!(r#"{{"execution_id": "{}"}}"#, id)),
+            correlation_id: None,
         }
     }
 

@@ -116,12 +116,14 @@ mod tests {
             client_order_id: Some("test-123".to_string()),
             extended_hours: false,
             notional: None,
+            correlation_id: Some("corr-priority-001".into()),
         })
     }
 
     fn create_cancel_request() -> GatewayRequest {
         GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("exec-123".to_string()),
+            correlation_id: Some("corr-priority-002".into()),
         })
     }
 

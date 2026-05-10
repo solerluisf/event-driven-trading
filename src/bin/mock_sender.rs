@@ -49,6 +49,7 @@ async fn main() {
         client_order_id: Some("test-idem-001".into()),
         extended_hours: false,
         notional: None,
+        correlation_id: Some("corr-submit-001".into()),
     });
 
     let response = send_and_recv(&socket, &submit).await;
@@ -63,6 +64,7 @@ async fn main() {
 
     let cancel = GatewayRequest::CancelOrder(CancelCmd {
         execution_id: ExecutionId(exec_id),
+        correlation_id: Some("corr-cancel-001".into()),
     });
 
     let response = send_and_recv(&socket, &cancel).await;

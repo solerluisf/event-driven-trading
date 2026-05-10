@@ -393,6 +393,7 @@ mod tests {
         ResponseRecord {
             id: id.to_string(),
             raw_payload: payload.map(|s| s.to_string()),
+            correlation_id: None,
         }
     }
 

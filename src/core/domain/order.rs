@@ -57,11 +57,17 @@ pub struct OrderCmd {
     pub client_order_id: Option<String>,
     pub extended_hours: bool,
     pub notional: Option<f64>,
+    /// Optional correlation ID for end-to-end request tracking.
+    /// If provided, this will be echoed back in the response.
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CancelCmd {
     pub execution_id: ExecutionId,
+    /// Optional correlation ID for end-to-end request tracking.
+    /// If provided, this will be echoed back in the response.
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -71,11 +77,17 @@ pub struct ReplaceCmd {
     pub side: OrderSide,
     pub qty: Option<u32>,
     pub limit_price: Option<f64>,
+    /// Optional correlation ID for end-to-end request tracking.
+    /// If provided, this will be echoed back in the response.
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StatusQuery {
     pub execution_id: ExecutionId,
+    /// Optional correlation ID for end-to-end request tracking.
+    /// If provided, this will be echoed back in the response.
+    pub correlation_id: Option<String>,
 }
 
 // --- Order Status Response ---

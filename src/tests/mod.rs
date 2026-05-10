@@ -51,6 +51,7 @@ fn make_order(symbol: &str) -> crate::core::domain::order::OrderCmd {
         client_order_id: None,
         extended_hours: false,
         notional: None,
+        correlation_id: None,
     }
 }
 
@@ -497,6 +498,7 @@ mod order_submission_tests {
         let result = svc
             .cancel_order(CancelCmd {
                 execution_id: ExecutionId("exec-123".into()),
+                correlation_id: Some("corr-cancel-test-001".into()),
             })
             .await;
         assert!(result.is_ok());
@@ -511,6 +513,7 @@ mod order_submission_tests {
         let err = svc
             .cancel_order(CancelCmd {
                 execution_id: ExecutionId("exec-123".into()),
+                correlation_id: Some("corr-cancel-test-002".into()),
             })
             .await
             .unwrap_err();
@@ -776,7 +779,7 @@ mod subscription_tests {
     #[tokio::test]
     async fn subscribe_sends_command_to_stream() {
         let (gateway, mut rx) = make_gateway_service();
-        let subscription = MarketSubscription { symbol: "TSLA".to_string() };
+        let subscription = MarketSubscription { symbol: "TSLA".to_string(), correlation_id: Some("corr-sub-test-001".into()) };
 
         // Subscribe
         let result = gateway.subscribe(subscription.clone()).await;
@@ -793,7 +796,7 @@ mod subscription_tests {
     #[tokio::test]
     async fn unsubscribe_sends_command_to_stream() {
         let (gateway, mut rx) = make_gateway_service();
-        let subscription = MarketSubscription { symbol: "GOOGL".to_string() };
+        let subscription = MarketSubscription { symbol: "GOOGL".to_string(), correlation_id: Some("corr-sub-test-002".into()) };
 
         // Unsubscribe
         let result = gateway.unsubscribe(subscription.clone()).await;
@@ -812,8 +815,8 @@ mod subscription_tests {
         let (gateway, mut rx) = make_gateway_service();
 
         // Subscribe to multiple symbols
-        let tsla_sub = MarketSubscription { symbol: "TSLA".to_string() };
-        let aapl_sub = MarketSubscription { symbol: "AAPL".to_string() };
+        let tsla_sub = MarketSubscription { symbol: "TSLA".to_string(), correlation_id: Some("corr-sub-test-003".into()) };
+        let aapl_sub = MarketSubscription { symbol: "AAPL".to_string(), correlation_id: Some("corr-sub-test-004".into()) };
 
         gateway.subscribe(tsla_sub).await.unwrap();
         gateway.subscribe(aapl_sub).await.unwrap();
@@ -834,7 +837,7 @@ mod subscription_tests {
     #[tokio::test]
     async fn subscribe_unsubscribe_sequence() {
         let (gateway, mut rx) = make_gateway_service();
-        let subscription = MarketSubscription { symbol: "MSFT".to_string() };
+        let subscription = MarketSubscription { symbol: "MSFT".to_string(), correlation_id: Some("corr-sub-test-005".into()) };
 
         // Subscribe then unsubscribe
         gateway.subscribe(subscription.clone()).await.unwrap();
@@ -873,6 +876,7 @@ mod replace_order_tests {
             side,
             qty,
             limit_price,
+            correlation_id: Some("corr-replace-test-001".into()),
         }
     }
 
@@ -916,6 +920,7 @@ mod replace_order_tests {
             side: OrderSide::Buy,
             qty: None,
             limit_price: None,
+            correlation_id: None,
         };
 
         let json = serde_json::to_string(&cmd).expect("should serialize");
@@ -1063,6 +1068,7 @@ mod replace_order_tests {
             side: OrderSide::Buy,
             qty: None,
             limit_price: None,
+            correlation_id: None,
         };
 
         let result = adapter.replace_order(cmd).await;
@@ -1394,6 +1400,7 @@ mod mock_adapter_query_status_tests {
         let adapter = MockAdapter;
         let query = StatusQuery {
             execution_id: ExecutionId("test-exec-id".to_string()),
+            correlation_id: Some("corr-query-test-001".into()),
         };
 
         let result = adapter.query_status(query).await;
@@ -1407,3 +1414,10 @@ mod mock_adapter_query_status_tests {
         assert_eq!(response.qty, 100);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Correlation ID Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[path = "correlation_tests.rs"]
+mod correlation_tests;

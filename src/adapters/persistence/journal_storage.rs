@@ -221,6 +221,7 @@ mod tests {
         RequestRecord {
             id: id.to_string(),
             raw_payload: Some(format!(r#"{{"test":"payload","id":"{}"}}"#, id)),
+            correlation_id: Some(format!("corr-{}", id)),
         }
     }
 
@@ -228,6 +229,7 @@ mod tests {
         ResponseRecord {
             id: id.to_string(),
             raw_payload: Some(format!(r#"{{"result":"success","id":"{}"}}"#, id)),
+            correlation_id: Some(format!("corr-{}", id)),
         }
     }
 
@@ -380,6 +382,7 @@ mod tests {
         let record = RequestRecord {
             id: "special-\"quoted\"-id".to_string(),
             raw_payload: Some(r#"{"data":"with \"quotes\" and \n newlines"}"#.to_string()),
+            correlation_id: Some("corr-special".into()),
         };
         
         let result = storage.persist_outbound(record);
@@ -399,6 +402,7 @@ mod tests {
         let record = RequestRecord {
             id: "large-payload-test".to_string(),
             raw_payload: Some(format!(r#"{{"data":"{}"}}"#, large_payload)),
+            correlation_id: Some("corr-large".into()),
         };
         
         let result = storage.persist_outbound(record);
@@ -460,6 +464,7 @@ mod tests {
         let record = RequestRecord {
             id: "none-payload-test".to_string(),
             raw_payload: None,
+            correlation_id: None,
         };
         
         let result = storage.persist_outbound(record);
