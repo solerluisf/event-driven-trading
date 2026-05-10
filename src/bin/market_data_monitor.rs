@@ -8,9 +8,7 @@
 
 
 
-use broker_gateway_service::adapters::messaging::wire_codec::{
-    decode_market_data_event, WireFormat,
-};
+use broker_gateway_service::adapters::messaging::wire_codec::decode_market_data_event;
 
 fn main() {
     let ctx = zmq::Context::new();
@@ -33,12 +31,11 @@ fn main() {
             .expect("recv error")
             .unwrap_or_default();
 
-        // Frame 2: MessagePack payload (with JSON fallback)
+        // Frame 2: MessagePack payload
         let payload = socket.recv_bytes(0).expect("recv error");
 
         let pretty = match decode_market_data_event(&payload) {
-            Ok((event, WireFormat::MessagePack)) => format!("{:#?}", event),
-            Ok((event, WireFormat::Json)) => format!("{:#?}  [legacy-json]", event),
+            Ok((event, _)) => format!("{:#?}", event),
             Err(e) => format!("failed to decode payload: {}", e),
         };
 

@@ -1,5 +1,4 @@
 use serde::{Serialize, de::DeserializeOwned};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::adapters::messaging::market_data_publisher::MarketDataEvent;
@@ -7,25 +6,21 @@ use crate::core::domain::order::OrderLifecycleEvent;
 use crate::core::domain::wire_message::{GatewayRequest, GatewayResponse};
 
 const MSGPACK_MAGIC: &[u8; 4] = b"BGW1";
-static STRICT_MSGPACK_DECODE: OnceLock<bool> = OnceLock::new();
 
 #[derive(Debug, Default)]
 pub struct WireCodecMetricsSnapshot {
     pub decode_msgpack_total: u64,
-    pub decode_json_total: u64,
     pub decode_error_total: u64,
     pub encode_error_total: u64,
 }
 
 static DECODE_MSGPACK_TOTAL: AtomicU64 = AtomicU64::new(0);
-static DECODE_JSON_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DECODE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ENCODE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireFormat {
     MessagePack,
-    Json,
 }
 
 fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
@@ -39,44 +34,29 @@ fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     Ok(framed)
 }
 
-fn decode_with_fallback<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, WireFormat), String> {
-    if bytes.starts_with(MSGPACK_MAGIC) {
-        let decoded = rmp_serde::from_slice::<T>(&bytes[MSGPACK_MAGIC.len()..]).map_err(|e| {
-            DECODE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
-            e.to_string()
-        })?;
-        DECODE_MSGPACK_TOTAL.fetch_add(1, Ordering::Relaxed);
-        return Ok((decoded, WireFormat::MessagePack));
-    }
-
-    if strict_msgpack_decode_enabled() {
+fn decode_msgpack<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, WireFormat), String> {
+    if !bytes.starts_with(MSGPACK_MAGIC) {
         DECODE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
         return Err(
-            "strict MessagePack decode is enabled; refusing non-MessagePack payload".to_string(),
+            format!(
+                "Invalid wire format: expected MessagePack ({} prefix), got payload starting with {:?}. " ,
+                String::from_utf8_lossy(MSGPACK_MAGIC),
+                bytes.get(0..4.min(bytes.len())).unwrap_or(bytes)
+            )
         );
     }
 
-    let decoded = serde_json::from_slice::<T>(bytes).map_err(|e| {
+    let decoded = rmp_serde::from_slice::<T>(&bytes[MSGPACK_MAGIC.len()..]).map_err(|e| {
         DECODE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
         e.to_string()
     })?;
-    DECODE_JSON_TOTAL.fetch_add(1, Ordering::Relaxed);
-    Ok((decoded, WireFormat::Json))
-}
-
-pub fn strict_msgpack_decode_enabled() -> bool {
-    *STRICT_MSGPACK_DECODE.get_or_init(|| {
-        std::env::var("GATEWAY_STRICT_MSGPACK_DECODE")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
+    DECODE_MSGPACK_TOTAL.fetch_add(1, Ordering::Relaxed);
+    Ok((decoded, WireFormat::MessagePack))
 }
 
 pub fn wire_codec_metrics_snapshot() -> WireCodecMetricsSnapshot {
     WireCodecMetricsSnapshot {
         decode_msgpack_total: DECODE_MSGPACK_TOTAL.load(Ordering::Relaxed),
-        decode_json_total: DECODE_JSON_TOTAL.load(Ordering::Relaxed),
         decode_error_total: DECODE_ERROR_TOTAL.load(Ordering::Relaxed),
         encode_error_total: ENCODE_ERROR_TOTAL.load(Ordering::Relaxed),
     }
@@ -87,7 +67,7 @@ pub fn encode_gateway_request(req: &GatewayRequest) -> Result<Vec<u8>, String> {
 }
 
 pub fn decode_gateway_request(bytes: &[u8]) -> Result<(GatewayRequest, WireFormat), String> {
-    decode_with_fallback(bytes)
+    decode_msgpack(bytes)
 }
 
 pub fn encode_gateway_response(resp: &GatewayResponse) -> Result<Vec<u8>, String> {
@@ -95,7 +75,7 @@ pub fn encode_gateway_response(resp: &GatewayResponse) -> Result<Vec<u8>, String
 }
 
 pub fn decode_gateway_response(bytes: &[u8]) -> Result<(GatewayResponse, WireFormat), String> {
-    decode_with_fallback(bytes)
+    decode_msgpack(bytes)
 }
 
 pub fn encode_market_data_event(event: &MarketDataEvent) -> Result<Vec<u8>, String> {
@@ -103,7 +83,7 @@ pub fn encode_market_data_event(event: &MarketDataEvent) -> Result<Vec<u8>, Stri
 }
 
 pub fn decode_market_data_event(bytes: &[u8]) -> Result<(MarketDataEvent, WireFormat), String> {
-    decode_with_fallback(bytes)
+    decode_msgpack(bytes)
 }
 
 pub fn encode_order_lifecycle_event(event: &OrderLifecycleEvent) -> Result<Vec<u8>, String> {
@@ -111,7 +91,7 @@ pub fn encode_order_lifecycle_event(event: &OrderLifecycleEvent) -> Result<Vec<u
 }
 
 pub fn decode_order_lifecycle_event(bytes: &[u8]) -> Result<(OrderLifecycleEvent, WireFormat), String> {
-    decode_with_fallback(bytes)
+    decode_msgpack(bytes)
 }
 
 #[cfg(test)]
@@ -173,25 +153,26 @@ mod tests {
     }
 
     #[test]
-    fn gateway_request_decodes_legacy_json_fallback() {
-        let json_bytes = serde_json::to_vec(&GatewayRequest::Subscribe(MarketSubscription {
-            symbol: "TSLA".to_string(),
-        }))
-        .expect("json serialize should succeed");
-
-        let (decoded, format) =
-            decode_gateway_request(&json_bytes).expect("json fallback decode should succeed");
-
-        assert_eq!(format, WireFormat::Json);
-        assert!(matches!(decoded, GatewayRequest::Subscribe(_)));
-    }
-
-    #[test]
     fn decode_invalid_payload_returns_error() {
         let bad_payload = vec![0x01, 0x02, 0x03, 0x04, 0x05];
         assert!(decode_gateway_request(&bad_payload).is_err());
         assert!(decode_gateway_response(&bad_payload).is_err());
         assert!(decode_market_data_event(&bad_payload).is_err());
+    }
+
+    #[test]
+    fn decode_json_payload_returns_error() {
+        // JSON payloads should be rejected - only MessagePack is supported
+        let json_bytes = serde_json::to_vec(&GatewayRequest::Subscribe(MarketSubscription {
+            symbol: "TSLA".to_string(),
+        }))
+        .expect("json serialize should succeed");
+
+        let result = decode_gateway_request(&json_bytes);
+        assert!(result.is_err(), "JSON should be rejected");
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("Invalid wire format"), "Error should mention invalid format: {}", err_msg);
+        assert!(err_msg.contains("BGW1"), "Error should mention expected prefix: {}", err_msg);
     }
 
     #[test]
@@ -272,7 +253,8 @@ mod tests {
     }
 
     #[test]
-    fn order_lifecycle_event_decodes_legacy_json_fallback() {
+    fn order_lifecycle_event_json_payload_returns_error() {
+        // JSON payloads should be rejected - only MessagePack is supported
         let event = OrderLifecycleEvent {
             event_id: "evt-json".to_string(),
             execution_id: "exec-json".to_string(),
@@ -285,13 +267,10 @@ mod tests {
 
         let json_bytes = serde_json::to_vec(&event).expect("json serialize should succeed");
 
-        let (decoded, format) =
-            decode_order_lifecycle_event(&json_bytes).expect("json fallback decode should succeed");
-
-        assert_eq!(format, WireFormat::Json);
-        assert_eq!(decoded.event_id, "evt-json");
-        assert_eq!(decoded.event_type, OrderLifecycleEventType::Submitted);
-        assert_eq!(decoded.payload["test"], "json");
+        let result = decode_order_lifecycle_event(&json_bytes);
+        assert!(result.is_err(), "JSON should be rejected");
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("Invalid wire format"), "Error should mention invalid format");
     }
 
     #[test]
@@ -352,4 +331,5 @@ mod tests {
         assert_eq!(decoded.payload["execution_venue"], "NYSE");
         assert_eq!(decoded.payload["metadata"]["algo_id"], "algo-1");
     }
+
 }

@@ -11,8 +11,7 @@
 //                               ──►  Observability Service (SUB)
 //
 // Topic format: "order_lifecycle.<execution_id>" e.g. "order_lifecycle.123e4567"
-// Payload: MessagePack-serialized OrderLifecycleEvent (with JSON decode fallback
-// in consumers via wire_codec)
+// Payload: MessagePack-serialized OrderLifecycleEvent
 
 use tokio::sync::mpsc;
 

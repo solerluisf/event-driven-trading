@@ -23,7 +23,7 @@ use crate::core::domain::wire_message::{
     GatewayRequest, GatewayResponse, ResponsePayload, ErrorPayload,
 };
 use super::wire_codec::{
-    decode_gateway_request, encode_gateway_response, WireFormat,
+    decode_gateway_request, encode_gateway_response,
 };
 
 /// Message sent from ZMQ thread to async processor
@@ -185,10 +185,7 @@ impl BusAdapter {
                     message: e,
                 })
             }
-            Ok((req, wire_format)) => {
-                if wire_format == WireFormat::Json {
-                    tracing::debug!("Received legacy JSON request; consider upgrading client to MessagePack");
-                }
+            Ok((req, _)) => {
                 self.dispatch(req, gateway).await
             }
         };

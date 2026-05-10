@@ -9,8 +9,7 @@
 //   Gateway (PUB, this file)  ──►  Market Data Service (SUB)
 //
 // Topic format: "market_data.<symbol>" e.g. "market_data.AAPL"
-// Payload: MessagePack-serialized MarketDataEvent (with JSON decode fallback
-// in consumers via wire_codec)
+// Payload: MessagePack-serialized MarketDataEvent
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
