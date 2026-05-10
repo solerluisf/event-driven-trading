@@ -8,6 +8,7 @@ use crate::core::domain::order::{
     ReplaceCmd,
     StatusQuery,
     ExecutionId,
+    OrderStatusResponse,
 };
 use crate::adapters::broker::broker_error::BrokerError;
 
@@ -30,7 +31,7 @@ impl IExecutionPort for WebSocketBrokerAdapter {
         todo!()
     }
 
-    async fn query_status(&self, _query: StatusQuery) -> Result<(), Self::Error> {
+    async fn query_status(&self, _query: StatusQuery) -> Result<OrderStatusResponse, Self::Error> {
         todo!()
     }
 }

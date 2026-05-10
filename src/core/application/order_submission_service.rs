@@ -9,7 +9,7 @@ use crate::core::application::validator::RequestValidator;
 use crate::core::application::idempotency::IdempotencyStore;
 use crate::core::application::kill_switch::KillSwitch;
 use crate::core::application::rate_limiter::RateLimiterManager;
-use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId};
+use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId, OrderStatusResponse};
 use crate::core::ports::execution_port::IExecutionPort;
 use crate::core::patterns::circuit_breaker::CircuitBreaker;
 use crate::adapters::broker::broker_error::BrokerError;
@@ -154,7 +154,7 @@ impl OrderSubmissionService {
         result
     }
 
-    pub async fn query_status(&self, query: StatusQuery) -> Result<(), BrokerError> {
+    pub async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
         self.pre_flight()?;
 
         let result = self.execution_port.query_status(query).await;

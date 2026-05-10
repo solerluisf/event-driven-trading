@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::ports::execution_port::IExecutionPort;
 use crate::core::ports::journal_repo::IJournalRepo;
-use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId};
+use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId, OrderSide, OrderStatusResponse};
 use crate::adapters::broker::broker_error::BrokerError;
 use crate::core::domain::journal::ResponseRecord;
 
@@ -287,17 +287,55 @@ impl IExecutionPort for ReplayBrokerAdapter {
         Ok(())
     }
 
-    async fn query_status(&self, query: StatusQuery) -> Result<(), Self::Error> {
+    async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, Self::Error> {
         tracing::info!(
             "Replay: query_status for {} (not calling live broker)",
             query.execution_id.0
         );
 
-        let _response = self.get_next_response().await.map_err(|e| {
+        let response = self.get_next_response().await.map_err(|e| {
             BrokerError::Unknown(format!("Replay error: {}", e))
         })?;
 
-        Ok(())
+        // Try to parse order status from the response payload
+        if let Some(ref payload) = response.raw_payload {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) {
+                let status = json.get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let symbol = json.get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN");
+                let side_str = json.get("side")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("buy");
+                let qty = json.get("qty")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(100) as u32;
+
+                let side = match side_str.to_lowercase().as_str() {
+                    "sell" => OrderSide::Sell,
+                    _ => OrderSide::Buy,
+                };
+
+                return Ok(OrderStatusResponse::new(
+                    query.execution_id.0.clone(),
+                    status,
+                    symbol,
+                    side,
+                    qty,
+                ));
+            }
+        }
+
+        // Return a default response if parsing fails
+        Ok(OrderStatusResponse::new(
+            query.execution_id.0.clone(),
+            "new",
+            "REPLAY",
+            OrderSide::Buy,
+            100,
+        ))
     }
 }
 

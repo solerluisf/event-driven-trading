@@ -326,10 +326,15 @@ impl BusAdapter {
             GatewayRequest::QueryStatus(query) => {
                 let correlation_id = Some(query.execution_id.0.clone());
                 match gateway.query_status(query).await {
-                    Ok(()) => GatewayResponse::Ok(ResponsePayload {
-                        correlation_id,
-                        result: "ok".into(),
-                    }),
+                    Ok(status_response) => {
+                        // Serialize the order status response as JSON
+                        let result_json = serde_json::to_string(&status_response)
+                            .unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".to_string());
+                        GatewayResponse::Ok(ResponsePayload {
+                            correlation_id,
+                            result: result_json,
+                        })
+                    }
                     Err(e) => GatewayResponse::Err(ErrorPayload {
                         correlation_id,
                         code: "QUERY_FAILED".into(),

@@ -78,6 +78,87 @@ pub struct StatusQuery {
     pub execution_id: ExecutionId,
 }
 
+// --- Order Status Response ---
+
+/// Response returned by `query_status` containing the current order state.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct OrderStatusResponse {
+    /// The order's execution ID (from the broker)
+    pub execution_id: String,
+    /// Current status of the order (e.g., "new", "filled", "canceled", "rejected")
+    pub status: String,
+    /// Symbol being traded
+    pub symbol: String,
+    /// Side of the order (Buy/Sell)
+    pub side: OrderSide,
+    /// Original order quantity
+    pub qty: u32,
+    /// Filled quantity (if partially or fully filled)
+    pub filled_qty: u32,
+    /// Average fill price (if filled)
+    pub avg_fill_price: Option<f64>,
+    /// Remaining quantity to be filled
+    pub remaining_qty: u32,
+    /// Timestamp of the last status update
+    pub updated_at: String,
+    /// Raw status from the broker (for debugging/completeness)
+    pub raw_status: Option<String>,
+}
+
+impl OrderStatusResponse {
+    /// Create a new OrderStatusResponse with the required fields
+    pub fn new(
+        execution_id: impl Into<String>,
+        status: impl Into<String>,
+        symbol: impl Into<String>,
+        side: OrderSide,
+        qty: u32,
+    ) -> Self {
+        Self {
+            execution_id: execution_id.into(),
+            status: status.into(),
+            symbol: symbol.into(),
+            side,
+            qty,
+            filled_qty: 0,
+            avg_fill_price: None,
+            remaining_qty: qty,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            raw_status: None,
+        }
+    }
+
+    /// Set the fill information
+    pub fn with_fill(mut self, filled_qty: u32, avg_fill_price: f64) -> Self {
+        self.filled_qty = filled_qty;
+        self.avg_fill_price = Some(avg_fill_price);
+        self.remaining_qty = self.qty.saturating_sub(filled_qty);
+        self
+    }
+
+    /// Set the raw broker status
+    pub fn with_raw_status(mut self, raw: impl Into<String>) -> Self {
+        self.raw_status = Some(raw.into());
+        self
+    }
+
+    /// Check if the order is in a terminal state (filled, canceled, rejected, expired)
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "filled" | "canceled" | "cancelled" | "rejected" | "expired" | "done_for_day"
+        )
+    }
+
+    /// Check if the order is still open
+    pub fn is_open(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "new" | "accepted" | "pending" | "partially_filled" | "held"
+        )
+    }
+}
+
 // --- Order Lifecycle Events for PUB/SUB ---
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

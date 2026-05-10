@@ -16,7 +16,7 @@ use crate::core::ports::service_traits::{
     IObservabilityService,
 };
 
-use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId};
+use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId, OrderStatusResponse};
 use crate::core::domain::journal::{RequestRecord, ResponseRecord};
 use crate::adapters::broker::broker_error::BrokerError;
 
@@ -33,7 +33,7 @@ impl IOrderSubmissionService for OrderSubmissionService {
     async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), BrokerError> {
         self.replace_order(cmd).await
     }
-    async fn query_status(&self, query: StatusQuery) -> Result<(), BrokerError> {
+    async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
         self.query_status(query).await
     }
 }

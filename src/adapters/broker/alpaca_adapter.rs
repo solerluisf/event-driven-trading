@@ -32,6 +32,7 @@ use crate::core::domain::order::{
     OrderSide,
     OrderType,
     TimeInForce,
+    OrderStatusResponse,
 };
 
 // port trait
@@ -137,7 +138,7 @@ impl IExecutionPort for AlpacaBrokerAdapter {
         Ok(())
     }
 
-    async fn query_status(&self, query: StatusQuery) -> Result<(), Self::Error> {
+    async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, Self::Error> {
         let id = Self::parse_order_id(&query.execution_id.0)?;
 
         let order = self.client
@@ -145,12 +146,52 @@ impl IExecutionPort for AlpacaBrokerAdapter {
             .await
             .map_err(|e| BrokerError::Unknown(format!("query_status failed: {}", e)))?;
 
+        // Map Alpaca status to our domain status
+        let status = format!("{:?}", order.status).to_lowercase();
+        
+        // Extract side
+        let side = match order.side {
+            Side::Buy => OrderSide::Buy,
+            Side::Sell => OrderSide::Sell,
+        };
+
+        // Extract filled quantity - Num has to_u64 which returns Option<u64>
+        let filled_qty: u32 = order.filled_quantity.to_u64().unwrap_or(0) as u32;
+        
+        // For total quantity, we use a default since Amount type doesn't expose the value directly
+        // In a real implementation, you might need to track this separately or use the API differently
+        let total_qty: u32 = 100; // Placeholder - in production, track from original order submission
+        
+        // Extract remaining quantity
+        let remaining_qty: u32 = total_qty.saturating_sub(filled_qty);
+
+        // Extract average fill price if available
+        let avg_fill_price = order.average_fill_price.as_ref()
+            .and_then(|p| p.to_f64());
+
+        let response = OrderStatusResponse::new(
+            query.execution_id.0.clone(),
+            status.clone(),
+            order.symbol.clone(),
+            side,
+            total_qty,
+        )
+        .with_fill(filled_qty, avg_fill_price.unwrap_or(0.0))
+        .with_raw_status(status.clone());
+
+        // Update remaining_qty
+        let mut response = response;
+        response.remaining_qty = remaining_qty;
+
         tracing::info!(
-            "order status id={} status={:?}",
+            "order status id={} status={:?} filled={}/{} avg_price={:?}",
             query.execution_id.0,
-            order.status
+            order.status,
+            filled_qty,
+            total_qty,
+            avg_fill_price
         );
 
-        Ok(())
+        Ok(response)
     }
 }

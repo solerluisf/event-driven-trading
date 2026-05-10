@@ -5,7 +5,7 @@
 // allows swapping implementations without changing core logic.
 
 use async_trait::async_trait;
-use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId};
+use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId, OrderStatusResponse};
 use crate::core::domain::journal::{RequestRecord, ResponseRecord};
 use crate::adapters::broker::broker_error::BrokerError;
 
@@ -15,7 +15,7 @@ pub trait IOrderSubmissionService: Send + Sync {
     async fn submit_order(&self, cmd: OrderCmd) -> Result<ExecutionId, BrokerError>;
     async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), BrokerError>;
     async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), BrokerError>;
-    async fn query_status(&self, query: StatusQuery) -> Result<(), BrokerError>;
+    async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError>;
 }
 
 /// Enforces kill switch and rate limits before any broker call.

@@ -14,7 +14,7 @@ use crate::core::ports::service_traits::{
 use crate::core::application::connection_manager::ConnectionManager;
 use crate::core::domain::execution_message::{ExecutionMessage, Message};
 use crate::core::domain::market_data::{MarketSubscription, MarketDataCommand};
-use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId};
+use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId, OrderStatusResponse};
 use crate::core::domain::journal::{RequestRecord, ResponseRecord};
 use crate::core::ports::market_data_port::IMarketDataPort;
 use crate::adapters::broker::broker_error::BrokerError;
@@ -163,7 +163,7 @@ impl GatewayService {
         }
     }
 
-    pub async fn query_status(&self, query: StatusQuery) -> Result<(), BrokerError> {
+    pub async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
         self.order_submission.query_status(query).await
     }
 

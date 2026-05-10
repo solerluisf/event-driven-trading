@@ -8,6 +8,8 @@ use crate::core::domain::order::{
     ReplaceCmd,
     StatusQuery,
     ExecutionId,
+    OrderStatusResponse,
+    OrderSide,
 };
 use crate::adapters::broker::broker_error::BrokerError;
 
@@ -30,7 +32,14 @@ impl IExecutionPort for MockAdapter {
         Ok(())
     }
 
-    async fn query_status(&self, _query: StatusQuery) -> Result<(), Self::Error> {
-        Ok(())
+    async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, Self::Error> {
+        // Return a mock status response for testing
+        Ok(OrderStatusResponse::new(
+            query.execution_id.0.clone(),
+            "new",
+            "MOCK",
+            OrderSide::Buy,
+            100,
+        ))
     }
 }
