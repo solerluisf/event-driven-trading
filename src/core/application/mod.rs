@@ -8,5 +8,6 @@ pub mod observability_service;      // ✅ new
 pub mod order_submission_service;   // ✅ new
 pub mod rate_limiter;
 pub mod risk_management_service;    // ✅ new
+pub mod stream_monitor;             // ✅ new: gap detection and silent disconnect monitoring
 pub mod validator;
 pub mod service_impls;             // ✅ new: implements the port traits on the services
