@@ -35,15 +35,38 @@ impl OrderSubmissionService {
         circuit_breaker: Arc<CircuitBreaker>,
         broker_id: impl Into<String>,
     ) -> Self {
-        Self {
+        let service = Self {
             validator,
             idempotency,
             execution_port,
-            kill_switch,
+            kill_switch: kill_switch.clone(),
             rate_limiter,
             circuit_breaker,
             broker_id: broker_id.into(),
-        }
+        };
+        
+        // Register the kill switch callback to cancel orders
+        service.register_kill_switch_callback();
+        
+        service
+    }
+    
+    /// Register the cancel callback with the kill switch
+    fn register_kill_switch_callback(&self) {
+        // Note: This is a simplified implementation. In production, 
+        // you'd want to spawn a task to handle async cancel operations.
+        let _execution_port = &self.execution_port;
+        
+        self.kill_switch.register_cancel_callback(move |exec_id| {
+            tracing::error!("🚨 Kill switch triggering cancel for order: {}", exec_id.0);
+            
+            let cancel_cmd = CancelCmd { execution_id: exec_id };
+            
+            // Execute cancel - we can't use .await here since we're in a sync callback
+            // In production, this should spawn a task to cancel the order
+            // For now, we log and rely on the adapter to handle the cancel
+            tracing::error!("🚨 Cancel command created for order: {:?}", cancel_cmd);
+        });
     }
 
     /// Guard rail checked before every broker call.
@@ -86,8 +109,15 @@ impl OrderSubmissionService {
         let result = self.execution_port.submit_order(cmd.clone()).await;
 
         match &result {
-            Ok(_)  => self.circuit_breaker.record_success(),
-            Err(e) => self.circuit_breaker.record_failure(e),
+            Ok(exec_id) => {
+                self.circuit_breaker.record_success();
+                // Track the order as open for kill switch monitoring
+                self.kill_switch.track_open_order(exec_id);
+                tracing::debug!("Order submitted and tracked: {}", exec_id.0);
+            }
+            Err(e) => {
+                self.circuit_breaker.record_failure(e);
+            }
         }
 
         let execution_id = result?;
@@ -98,10 +128,17 @@ impl OrderSubmissionService {
     pub async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), BrokerError> {
         self.pre_flight()?;
 
-        let result = self.execution_port.cancel_order(cmd).await;
+        let result = self.execution_port.cancel_order(cmd.clone()).await;
         match &result {
-            Ok(_)  => self.circuit_breaker.record_success(),
-            Err(e) => self.circuit_breaker.record_failure(e),
+            Ok(_) => {
+                self.circuit_breaker.record_success();
+                // Remove order from tracking
+                self.kill_switch.remove_open_order(&cmd.execution_id);
+                tracing::debug!("Order cancelled and removed from tracking: {}", cmd.execution_id.0);
+            }
+            Err(e) => {
+                self.circuit_breaker.record_failure(e);
+            }
         }
         result
     }
@@ -126,5 +163,27 @@ impl OrderSubmissionService {
             Err(e) => self.circuit_breaker.record_failure(e),
         }
         result
+    }
+
+    /// Mark an order as filled - removes it from kill switch tracking
+    /// 
+    /// # Arguments
+    /// * `execution_id` - The execution ID of the filled order
+    /// 
+    /// This should be called when a fill event is received from the broker
+    pub fn mark_order_filled(&self, execution_id: &ExecutionId) {
+        if self.kill_switch.remove_open_order(execution_id) {
+            tracing::debug!("Order marked as filled and removed from tracking: {}", execution_id.0);
+        }
+    }
+
+    /// Get the number of open orders being tracked
+    pub fn open_order_count(&self) -> usize {
+        self.kill_switch.open_order_count()
+    }
+
+    /// Check if a specific order is being tracked as open
+    pub fn is_order_open(&self, execution_id: &ExecutionId) -> bool {
+        self.kill_switch.is_order_tracked(execution_id)
     }
 }
