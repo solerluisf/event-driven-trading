@@ -1,18 +1,19 @@
 // core/application/risk_management_service.rs
 
+use std::sync::Arc;
 use crate::core::application::kill_switch::KillSwitch;
 use crate::core::application::rate_limiter::RateLimiterManager;
 use crate::adapters::broker::broker_error::BrokerError;
 
 pub struct RiskManagementService {
     kill_switch: KillSwitch,
-    rate_limiter: RateLimiterManager,
+    rate_limiter: Arc<RateLimiterManager>,
 }
 
 impl RiskManagementService {
     pub fn new(
         kill_switch: KillSwitch,
-        rate_limiter: RateLimiterManager,
+        rate_limiter: Arc<RateLimiterManager>,
     ) -> Self {
         Self {
             kill_switch,

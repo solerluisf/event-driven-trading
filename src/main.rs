@@ -116,7 +116,7 @@ async fn main() {
 
     let risk_management = Arc::new(RiskManagementService::new(
         (*kill_switch).clone(),
-        RateLimiterManager::new(cfg.rate_limit_rpm),
+        Arc::clone(&rate_limiter),
     )) as Arc<dyn IRiskManagementService>;
 
     let observability = Arc::new(ObservabilityService::new(

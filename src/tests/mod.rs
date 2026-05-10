@@ -350,13 +350,14 @@ mod circuit_breaker_tests {
 
 #[cfg(test)]
 mod risk_management_tests {
+    use std::sync::Arc;
     use crate::adapters::broker::broker_error::BrokerError;
     use crate::core::application::kill_switch::KillSwitch;
     use crate::core::application::rate_limiter::RateLimiterManager;
     use crate::core::application::risk_management_service::RiskManagementService;
 
     fn make_svc(rpm: f64) -> RiskManagementService {
-        RiskManagementService::new(KillSwitch::default(), RateLimiterManager::new(rpm))
+        RiskManagementService::new(KillSwitch::default(), Arc::new(RateLimiterManager::new(rpm)))
     }
 
     #[test]
@@ -751,7 +752,7 @@ mod subscription_tests {
 
         let risk_management = Arc::new(RiskManagementService::new(
             KillSwitch::default(),
-            RateLimiterManager::new(200.0),
+            Arc::new(RateLimiterManager::new(200.0)),
         )) as Arc<dyn IRiskManagementService>;
 
         let observability = Arc::new(ObservabilityService::new(

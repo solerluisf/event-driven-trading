@@ -445,7 +445,7 @@ mod tests {
 
         let risk_management = Arc::new(RiskManagementService::new(
             KillSwitch::default(),
-            RateLimiterManager::new(200.0),
+            Arc::new(RateLimiterManager::new(200.0)),
         )) as Arc<dyn IRiskManagementService>;
 
         let observability = Arc::new(ObservabilityService::new(
