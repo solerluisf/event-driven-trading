@@ -231,6 +231,9 @@ impl TelemetryDecorator {
     /// 
     /// # Returns
     /// A tuple of (result, telemetry_event)
+    /// 
+    /// # Note
+    /// This version cannot detect errors. Use `wrap_outbound_result` for Result-returning operations.
     pub fn wrap_outbound<F, T>(&self, operation_name: impl Into<String>, target: impl Into<String>, f: F) -> (T, TelemetryEvent)
     where
         F: FnOnce() -> T,
@@ -259,6 +262,94 @@ impl TelemetryDecorator {
             error_message: None,
             target,
             success: true,
+        };
+        
+        self.emit_event(event.clone());
+        (result, event)
+    }
+
+    /// Wrap an outbound operation that returns a Result, with full error tracking
+    /// 
+    /// # Arguments
+    /// * `operation_name` - Name of the operation for identification
+    /// * `target` - Target broker/exchange
+    /// * `f` - The operation to wrap (must return Result)
+    /// * `error_classifier` - Optional function to classify errors
+    /// 
+    /// # Returns
+    /// A tuple of (result, telemetry_event) where telemetry includes error info
+    /// 
+    /// # Example
+    /// ```
+    /// use broker_gateway_service::core::patterns::telemetry_decorator::TelemetryDecorator;
+    /// 
+    /// let decorator = TelemetryDecorator::new();
+    /// 
+    /// // Example error classifier function
+    /// fn classify_error(e: &std::io::Error) -> &'static str {
+    ///     use std::io::ErrorKind;
+    ///     match e.kind() {
+    ///         ErrorKind::NotFound => "not_found",
+    ///         ErrorKind::ConnectionRefused => "connection_refused",
+    ///         _ => "unknown_io_error",
+    ///     }
+    /// }
+    /// 
+    /// let (result, event) = decorator.wrap_outbound_result(
+    ///     "read_file",
+    ///     "filesystem",
+    ///     || Ok::<String, std::io::Error>("data".to_string()),
+    ///     Some(classify_error)
+    /// );
+    /// 
+    /// assert!(result.is_ok());
+    /// assert!(event.success);
+    /// ```
+    pub fn wrap_outbound_result<F, T, E>(
+        &self,
+        operation_name: impl Into<String>,
+        target: impl Into<String>,
+        f: F,
+        error_classifier: Option<fn(&E) -> &'static str>,
+    ) -> (Result<T, E>, TelemetryEvent)
+    where
+        F: FnOnce() -> Result<T, E>,
+        E: std::fmt::Display,
+    {
+        let operation_name = operation_name.into();
+        let target = target.into();
+        let start = Instant::now();
+        let trace_id = TraceId::new();
+        
+        // Execute the operation
+        let result = f();
+        
+        let end = Instant::now();
+        let latency = end.duration_since(start);
+        
+        // Extract error information if failed
+        let (success, error_type, error_message) = match &result {
+            Ok(_) => (true, None, None),
+            Err(e) => {
+                let error_type = error_classifier.map(|classifier| classifier(e).to_string());
+                let error_message = Some(e.to_string());
+                (false, error_type, error_message)
+            }
+        };
+        
+        let event = TelemetryEvent {
+            trace_id,
+            operation: operation_name,
+            start_time: start,
+            end_time: end,
+            latency,
+            status_code: None, // Can be set by caller if known
+            request_payload_size: 0,
+            response_payload_size: 0,
+            error_type,
+            error_message,
+            target,
+            success,
         };
         
         self.emit_event(event.clone());
@@ -301,6 +392,68 @@ impl TelemetryDecorator {
             error_message: None,
             target,
             success: true,
+        };
+        
+        self.emit_event(event.clone());
+        (result, event)
+    }
+
+    /// Wrap an outbound async operation that returns a Result, with full error tracking
+    /// 
+    /// # Arguments
+    /// * `operation_name` - Name of the operation for identification
+    /// * `target` - Target broker/exchange
+    /// * `f` - The async operation to wrap (must return Result)
+    /// * `error_classifier` - Optional function to classify errors
+    /// 
+    /// # Returns
+    /// A tuple of (result, telemetry_event) where telemetry includes error info
+    pub async fn wrap_outbound_result_async<F, Fut, T, E>(
+        &self,
+        operation_name: impl Into<String>,
+        target: impl Into<String>,
+        f: F,
+        error_classifier: Option<fn(&E) -> &'static str>,
+    ) -> (Result<T, E>, TelemetryEvent)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        let operation_name = operation_name.into();
+        let target = target.into();
+        let start = Instant::now();
+        let trace_id = TraceId::new();
+        
+        // Execute the async operation
+        let result = f().await;
+        
+        let end = Instant::now();
+        let latency = end.duration_since(start);
+        
+        // Extract error information if failed
+        let (success, error_type, error_message) = match &result {
+            Ok(_) => (true, None, None),
+            Err(e) => {
+                let error_type = error_classifier.map(|classifier| classifier(e).to_string());
+                let error_message = Some(e.to_string());
+                (false, error_type, error_message)
+            }
+        };
+        
+        let event = TelemetryEvent {
+            trace_id,
+            operation: operation_name,
+            start_time: start,
+            end_time: end,
+            latency,
+            status_code: None,
+            request_payload_size: 0,
+            response_payload_size: 0,
+            error_type,
+            error_message,
+            target,
+            success,
         };
         
         self.emit_event(event.clone());
@@ -575,5 +728,220 @@ mod tests {
             let id = TraceId::new();
             assert!(ids.insert(id), "Duplicate trace ID generated");
         }
+    }
+
+    // =========================================================================
+    // NEW: Result-based error tracking tests
+    // =========================================================================
+
+    #[derive(Debug)]
+    enum TestError {
+        NotFound,
+        RateLimited,
+        ConnectionFailed(String),
+    }
+
+    impl std::fmt::Display for TestError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                TestError::NotFound => write!(f, "Resource not found"),
+                TestError::RateLimited => write!(f, "Rate limit exceeded"),
+                TestError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
+            }
+        }
+    }
+
+    fn classify_test_error(e: &TestError) -> &'static str {
+        match e {
+            TestError::NotFound => "not_found",
+            TestError::RateLimited => "rate_limited",
+            TestError::ConnectionFailed(_) => "connection_error",
+        }
+    }
+
+    #[test]
+    fn test_wrap_outbound_result_success() {
+        let decorator = TelemetryDecorator::new();
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        
+        decorator.register_callback(move |event| {
+            *received_clone.lock().unwrap() = Some(event);
+        });
+        
+        let (result, event) = decorator.wrap_outbound_result(
+            "submit_order",
+            "alpaca",
+            || Ok::<i32, TestError>(42),
+            Some(classify_test_error),
+        );
+        
+        assert_eq!(result.unwrap(), 42);
+        assert!(event.success);
+        assert!(event.error_type.is_none());
+        assert!(event.error_message.is_none());
+        assert!(event.latency > Duration::from_nanos(0));
+        
+        // Verify callback received the event
+        let received_event = received.lock().unwrap().clone().expect("Event should be received");
+        assert!(received_event.success);
+    }
+
+    #[test]
+    fn test_wrap_outbound_result_error_with_classification() {
+        let decorator = TelemetryDecorator::new();
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        
+        decorator.register_callback(move |event| {
+            *received_clone.lock().unwrap() = Some(event);
+        });
+        
+        let (result, event) = decorator.wrap_outbound_result(
+            "submit_order",
+            "alpaca",
+            || Err::<i32, TestError>(TestError::RateLimited),
+            Some(classify_test_error),
+        );
+        
+        assert!(result.is_err());
+        assert!(!event.success);
+        assert_eq!(event.error_type, Some("rate_limited".to_string()));
+        assert_eq!(event.error_message, Some("Rate limit exceeded".to_string()));
+        
+        // Verify callback received the error event
+        let received_event = received.lock().unwrap().clone().expect("Event should be received");
+        assert!(!received_event.success);
+        assert_eq!(received_event.error_type, Some("rate_limited".to_string()));
+    }
+
+    #[test]
+    fn test_wrap_outbound_result_error_without_classifier() {
+        let decorator = TelemetryDecorator::new();
+        
+        let (result, event) = decorator.wrap_outbound_result(
+            "submit_order",
+            "alpaca",
+            || Err::<i32, TestError>(TestError::NotFound),
+            None, // No classifier
+        );
+        
+        assert!(result.is_err());
+        assert!(!event.success);
+        assert!(event.error_type.is_none()); // No classifier = no error type
+        assert_eq!(event.error_message, Some("Resource not found".to_string()));
+    }
+
+    #[test]
+    fn test_wrap_outbound_result_different_error_types() {
+        let decorator = TelemetryDecorator::new();
+        
+        // Test NotFound
+        let (_, event) = decorator.wrap_outbound_result(
+            "query",
+            "alpaca",
+            || Err::<i32, TestError>(TestError::NotFound),
+            Some(classify_test_error),
+        );
+        assert_eq!(event.error_type, Some("not_found".to_string()));
+        
+        // Test ConnectionFailed
+        let (_, event) = decorator.wrap_outbound_result(
+            "submit",
+            "alpaca",
+            || Err::<i32, TestError>(TestError::ConnectionFailed("timeout".to_string())),
+            Some(classify_test_error),
+        );
+        assert_eq!(event.error_type, Some("connection_error".to_string()));
+        assert!(event.error_message.as_ref().unwrap().contains("timeout"));
+    }
+
+    #[test]
+    fn test_wrap_outbound_result_measures_latency() {
+        let decorator = TelemetryDecorator::new();
+        
+        let (_, event) = decorator.wrap_outbound_result(
+            "slow_op",
+            "alpaca",
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                Ok::<i32, TestError>(42)
+            },
+            None,
+        );
+        
+        assert!(event.latency >= Duration::from_millis(45));
+    }
+
+    #[test]
+    fn test_wrap_outbound_result_preserves_result() {
+        let decorator = TelemetryDecorator::new();
+        
+        // Success case
+        let (result, _) = decorator.wrap_outbound_result(
+            "test",
+            "alpaca",
+            || Ok::<i32, TestError>(123),
+            None,
+        );
+        assert_eq!(result.unwrap(), 123);
+        
+        // Error case
+        let (result, _) = decorator.wrap_outbound_result(
+            "test",
+            "alpaca",
+            || Err::<i32, TestError>(TestError::NotFound),
+            None,
+        );
+        assert!(matches!(result.unwrap_err(), TestError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn test_wrap_outbound_result_async_success() {
+        let decorator = TelemetryDecorator::new();
+        
+        let (result, event) = decorator.wrap_outbound_result_async(
+            "async_op",
+            "alpaca",
+            || async { Ok::<i32, TestError>(42) },
+            Some(classify_test_error),
+        ).await;
+        
+        assert_eq!(result.unwrap(), 42);
+        assert!(event.success);
+        assert!(event.error_type.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wrap_outbound_result_async_error() {
+        let decorator = TelemetryDecorator::new();
+        
+        let (result, event) = decorator.wrap_outbound_result_async(
+            "async_op",
+            "alpaca",
+            || async { Err::<i32, TestError>(TestError::RateLimited) },
+            Some(classify_test_error),
+        ).await;
+        
+        assert!(result.is_err());
+        assert!(!event.success);
+        assert_eq!(event.error_type, Some("rate_limited".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_wrap_outbound_result_async_measures_latency() {
+        let decorator = TelemetryDecorator::new();
+        
+        let (_, event) = decorator.wrap_outbound_result_async(
+            "slow_async",
+            "alpaca",
+            || async {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                Ok::<i32, TestError>(42)
+            },
+            None,
+        ).await;
+        
+        assert!(event.latency >= Duration::from_millis(45));
     }
 }
