@@ -82,7 +82,7 @@ fn make_gateway_service() -> GatewayService {
     )) as Arc<dyn IRiskManagementService>;
 
     let observability = Arc::new(ObservabilityService::new(
-        broker_gateway_service::core::patterns::telemetry_decorator::TelemetryDecorator,
+        broker_gateway_service::core::patterns::telemetry_decorator::TelemetryDecorator::new(),
         noop_obs(),
         Arc::new(MockJournalRepo),
     )) as Arc<dyn IObservabilityService>;

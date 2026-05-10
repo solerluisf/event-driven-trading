@@ -120,7 +120,7 @@ async fn main() {
     )) as Arc<dyn IRiskManagementService>;
 
     let observability = Arc::new(ObservabilityService::new(
-        TelemetryDecorator,
+        TelemetryDecorator::new(),
         Arc::clone(&metrics) as Arc<dyn IObservability + Send + Sync>,
         Arc::clone(&journal) as Arc<dyn IJournalRepo + Send + Sync>,
     )) as Arc<dyn IObservabilityService>;

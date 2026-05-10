@@ -449,7 +449,7 @@ mod tests {
         )) as Arc<dyn IRiskManagementService>;
 
         let observability = Arc::new(ObservabilityService::new(
-            crate::core::patterns::telemetry_decorator::TelemetryDecorator,
+            crate::core::patterns::telemetry_decorator::TelemetryDecorator::new(),
             noop_obs(),
             Arc::new(MockJournalRepo),
         )) as Arc<dyn IObservabilityService>;

@@ -130,6 +130,7 @@ dependencies = [
  "futures",
  "futures-util",
  "num-decimal",
+ "rand 0.8.6",
  "redb",
  "rmp-serde",
  "serde",
