@@ -54,16 +54,20 @@ impl EventReactor {
         let handle = tokio::spawn(async move {
             let mut workers: HashMap<String, Vec<SymbolWorker>> = HashMap::new();
             let mut seq: u64 = 0;
+            let mut shutdown_requested = false;
 
             loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                // Check for shutdown conditions before blocking
+                if shutdown_requested || kill_switch.is_enabled() {
+                    info!("EventReactor: shutting down (requested={}, kill_switch={})", 
+                        shutdown_requested, kill_switch.is_enabled());
+                    break;
+                }
 
+                tokio::select! {
+                    biased; // Prioritize control commands over events
+                    
                     Some(cmd) = control_rx.recv() => {
-                        if kill_switch.is_enabled() {
-                            info!("EventReactor: kill switch triggered, shutting down");
-                            break;
-                        }
                         match cmd {
                             ControlCommand::Subscribe { symbol, handler, ack } => {
                                 info!("EventReactor: subscribing handler '{}' for {}", handler.name(), symbol);
@@ -85,16 +89,17 @@ impl EventReactor {
 
                             ControlCommand::Shutdown => {
                                 info!("EventReactor: shutdown command received");
-                                break;
+                                shutdown_requested = true;
                             }
                         }
                     }
 
                     Some(event) = event_rx.recv() => {
                         if kill_switch.is_enabled() {
-                            info!("EventReactor: kill switch triggered, shutting down");
+                            info!("EventReactor: kill switch triggered, dropping event and exiting");
                             break;
                         }
+                        
                         seq += 1;
                         let symbol = event.symbol.clone();
                         let envelope = ReactorEvent {
@@ -122,6 +127,12 @@ impl EventReactor {
                                 }
                             }
                         }
+                    }
+                    
+                    else => {
+                        // All channels closed, exit cleanly
+                        info!("EventReactor: all channels closed, exiting");
+                        break;
                     }
                 }
             }
