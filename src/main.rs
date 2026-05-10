@@ -100,7 +100,8 @@ async fn main() {
     let client = Client::new(api_info);
 
     let factory = AdapterFactory::new(Some(client));
-    let adapter = factory.create_adapter(BrokerConfig { name: cfg.broker.clone() });
+    let adapter = factory.create_adapter(BrokerConfig { name: cfg.broker.clone() })
+        .expect("Failed to create broker adapter - Alpaca client may already be consumed");
 
     // ── Application services ──────────────────────────────────────────────────
     let order_submission = Arc::new(OrderSubmissionService::new(
