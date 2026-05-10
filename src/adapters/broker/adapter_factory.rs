@@ -2,16 +2,19 @@
 
 
 use crate::core::domain::broker_config::BrokerConfig;
+use crate::core::domain::data_source::{DataSource, ExecutionConfig};
 use crate::core::ports::execution_port::IExecutionPort;
+use crate::core::ports::journal_repo::IJournalRepo;
 use crate::adapters::broker::broker_error::BrokerError;
 use crate::adapters::broker::alpaca_adapter::AlpacaBrokerAdapter;
 use crate::adapters::broker::mock_adapter::MockAdapter;
 use crate::adapters::broker::fix_adapter::FixBrokerAdapter;
 use crate::adapters::broker::rest_adapter::RestBrokerAdapter;
 use crate::adapters::broker::websocket_adapter::WebSocketBrokerAdapter;
+use crate::adapters::broker::replay_adapter::{ReplayBrokerAdapter, ReplayConfig};
 
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use apca::Client;
 
 /// Errors that can occur when creating adapters
@@ -21,6 +24,8 @@ pub enum AdapterFactoryError {
     AlpacaClientNotProvided,
     /// Alpaca client was already consumed by a previous adapter creation
     AlpacaClientAlreadyUsed,
+    /// Journal was not provided but is required for replay mode
+    JournalNotAvailable,
 }
 
 impl std::fmt::Display for AdapterFactoryError {
@@ -32,6 +37,9 @@ impl std::fmt::Display for AdapterFactoryError {
             AdapterFactoryError::AlpacaClientAlreadyUsed => {
                 write!(f, "Alpaca client already consumed by previous adapter creation")
             }
+            AdapterFactoryError::JournalNotAvailable => {
+                write!(f, "Journal not available but required for replay mode")
+            }
         }
     }
 }
@@ -40,12 +48,23 @@ impl std::error::Error for AdapterFactoryError {}
 
 pub struct AdapterFactory {
     alpaca_client: Mutex<Option<Client>>,
+    journal: Option<Arc<dyn IJournalRepo>>,
 }
 
 impl AdapterFactory {
+    /// Create a new adapter factory with optional Alpaca client
     pub fn new(alpaca_client: Option<Client>) -> Self {
         Self { 
-           alpaca_client: Mutex::new(alpaca_client), 
+           alpaca_client: Mutex::new(alpaca_client),
+           journal: None,
+        }
+    }
+
+    /// Create a new adapter factory with journal support for replay mode
+    pub fn with_journal(alpaca_client: Option<Client>, journal: Arc<dyn IJournalRepo>) -> Self {
+        Self { 
+           alpaca_client: Mutex::new(alpaca_client),
+           journal: Some(journal),
         }
     }
 
@@ -55,6 +74,11 @@ impl AdapterFactory {
             .lock()
             .unwrap()
             .is_some()
+    }
+
+    /// Check if journal is available for replay mode
+    pub fn is_journal_available(&self) -> bool {
+        self.journal.is_some()
     }
 
     /// Create an adapter for the given broker configuration
@@ -89,6 +113,52 @@ impl AdapterFactory {
         }
     }
 
+    /// Create an adapter based on execution configuration (supports replay mode)
+    /// 
+    /// # Arguments
+    /// * `exec_config` - The execution configuration with data source
+    /// * `broker_config` - The broker configuration (used as fallback for live mode)
+    /// 
+    /// # Returns
+    /// * `Ok(Box<dyn IExecutionPort>)` - The created adapter
+    /// * `Err(AdapterFactoryError)` - If required resources are not available
+    pub fn create_adapter_from_config(
+        &self,
+        exec_config: &ExecutionConfig,
+        broker_config: BrokerConfig,
+    ) -> Result<Box<dyn IExecutionPort<Error = BrokerError>>, AdapterFactoryError> {
+        match &exec_config.data_source {
+            DataSource::Live { broker } => {
+                let mut config = broker_config;
+                config.name = broker.clone();
+                self.create_adapter(config)
+            }
+            DataSource::Replay { query, loop_replay, latency_ms } => {
+                let journal = self.journal.clone()
+                    .ok_or(AdapterFactoryError::JournalNotAvailable)?;
+                
+                let replay_config = ReplayConfig {
+                    query: query.clone(),
+                    loop_replay: *loop_replay,
+                    artificial_latency_ms: *latency_ms,
+                    inject_errors: false,
+                    error_rate: 0.0,
+                };
+                
+                Ok(Box::new(ReplayBrokerAdapter::new(journal, replay_config)))
+            }
+            DataSource::Mock { .. } => {
+                Ok(Box::new(MockAdapter::default()))
+            }
+            DataSource::Hybrid { primary, .. } => {
+                // For now, use primary source (hybrid logic would be in the adapter itself)
+                let mut hybrid_exec_config = exec_config.clone();
+                hybrid_exec_config.data_source = (**primary).clone();
+                self.create_adapter_from_config(&hybrid_exec_config, broker_config)
+            }
+        }
+    }
+
     /// Create an adapter for the given broker configuration (legacy version)
     /// 
     /// # Panics
@@ -120,6 +190,40 @@ impl AdapterFactory {
 mod tests {
     use super::*;
     use crate::core::domain::broker_config::BrokerConfig;
+    use crate::core::domain::data_source::{DataSource, ExecutionConfig};
+    use crate::core::domain::journal::ResponseRecord;
+    use crate::core::ports::journal_repo::{IJournalRepo, JournalResult, JournalError};
+
+    struct MockJournal {
+        responses: Vec<ResponseRecord>,
+    }
+
+    impl MockJournal {
+        fn with_responses(responses: Vec<ResponseRecord>) -> Self {
+            Self { responses }
+        }
+    }
+
+    impl IJournalRepo for MockJournal {
+        fn persist_outbound(&self, _record: crate::core::domain::journal::RequestRecord) -> JournalResult<()> {
+            Ok(())
+        }
+
+        fn persist_inbound(&self, _record: ResponseRecord) -> JournalResult<()> {
+            Ok(())
+        }
+
+        fn replay(&self, _query: String) -> Vec<ResponseRecord> {
+            self.responses.clone()
+        }
+    }
+
+    fn create_test_response(id: &str) -> ResponseRecord {
+        ResponseRecord {
+            id: id.to_string(),
+            raw_payload: Some(format!(r#"{{"execution_id": "{}"}}"#, id)),
+        }
+    }
 
     #[test]
     fn test_create_mock_adapter_succeeds() {
@@ -213,8 +317,73 @@ mod tests {
     fn test_error_display_messages() {
         let not_provided = AdapterFactoryError::AlpacaClientNotProvided;
         let already_used = AdapterFactoryError::AlpacaClientAlreadyUsed;
+        let journal_not_available = AdapterFactoryError::JournalNotAvailable;
 
         assert!(not_provided.to_string().contains("not provided"));
         assert!(already_used.to_string().contains("already consumed"));
+        assert!(journal_not_available.to_string().contains("Journal not available"));
+    }
+
+    #[test]
+    fn test_factory_without_journal_returns_false() {
+        let factory = AdapterFactory::new(None);
+        assert!(!factory.is_journal_available());
+    }
+
+    #[test]
+    fn test_factory_with_journal_returns_true() {
+        let journal = Arc::new(MockJournal::with_responses(vec![]));
+        let factory = AdapterFactory::with_journal(None, journal);
+        assert!(factory.is_journal_available());
+    }
+
+    #[test]
+    fn test_create_adapter_from_config_live() {
+        let factory = AdapterFactory::new(None);
+        let exec_config = ExecutionConfig::live("mock");
+        let broker_config = BrokerConfig { name: "alpaca".to_string() };
+
+        let adapter = factory.create_adapter_from_config(&exec_config, broker_config);
+        assert!(adapter.is_ok());
+    }
+
+    #[test]
+    fn test_create_adapter_from_config_mock() {
+        let factory = AdapterFactory::new(None);
+        let exec_config = ExecutionConfig::backtest("test_scenario");
+        let broker_config = BrokerConfig { name: "alpaca".to_string() };
+
+        let adapter = factory.create_adapter_from_config(&exec_config, broker_config);
+        assert!(adapter.is_ok());
+    }
+
+    #[test]
+    fn test_create_adapter_from_config_replay_fails_without_journal() {
+        let factory = AdapterFactory::new(None);
+        let exec_config = ExecutionConfig::paper_with_replay("2024-01-15");
+        let broker_config = BrokerConfig { name: "alpaca".to_string() };
+
+        let result = factory.create_adapter_from_config(&exec_config, broker_config);
+        assert!(result.is_err());
+        match result {
+            Err(AdapterFactoryError::JournalNotAvailable) => (), // Expected
+            _ => panic!("Expected JournalNotAvailable error"),
+        }
+    }
+
+    #[test]
+    fn test_create_adapter_from_config_replay_succeeds_with_journal() {
+        let responses = vec![
+            create_test_response("1"),
+            create_test_response("2"),
+        ];
+        let journal = Arc::new(MockJournal::with_responses(responses));
+        let factory = AdapterFactory::with_journal(None, journal);
+        
+        let exec_config = ExecutionConfig::paper_with_replay("test");
+        let broker_config = BrokerConfig { name: "alpaca".to_string() };
+
+        let adapter = factory.create_adapter_from_config(&exec_config, broker_config);
+        assert!(adapter.is_ok());
     }
 }
