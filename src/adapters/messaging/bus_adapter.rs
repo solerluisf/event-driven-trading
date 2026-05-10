@@ -515,4 +515,158 @@ mod tests {
         let msg2 = rep_socket.recv_bytes(0).expect("rep recv 2");
         assert_eq!(msg2, b"second");
     }
+
+    // =========================================================================
+    // SYNC/ASYNC CRITICAL PATH TESTS
+    // =========================================================================
+    
+    use crate::core::domain::order::{OrderSide, OrderType, TimeInForce, OrderCmd, CancelCmd, ExecutionId, ReplaceCmd, StatusQuery};
+    use crate::adapters::messaging::priority_bus_adapter::{CommandPriority, BusAdapterConfig};
+
+    #[test]
+    fn test_submit_order_is_critical_priority() {
+        let req = GatewayRequest::SubmitOrder(OrderCmd {
+            symbol: "AAPL".to_string(),
+            qty: 100,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            stop_price: None,
+            client_order_id: Some("test-123".to_string()),
+            extended_hours: false,
+            notional: None,
+        });
+        assert_eq!(CommandPriority::for_request(&req), CommandPriority::Critical);
+        assert!(CommandPriority::for_request(&req).is_synchronous());
+    }
+
+    #[test]
+    fn test_cancel_order_is_critical_priority() {
+        let req = GatewayRequest::CancelOrder(CancelCmd {
+            execution_id: ExecutionId("exec-123".to_string()),
+        });
+        assert_eq!(CommandPriority::for_request(&req), CommandPriority::Critical);
+        assert!(CommandPriority::for_request(&req).is_synchronous());
+    }
+
+    #[test]
+    fn test_replace_order_is_critical_priority() {
+        let req = GatewayRequest::ReplaceOrder(ReplaceCmd {
+            execution_id: ExecutionId("exec-123".to_string()),
+            symbol: "AAPL".to_string(),
+            side: OrderSide::Buy,
+            qty: Some(200),
+            limit_price: Some(150.0),
+        });
+        assert_eq!(CommandPriority::for_request(&req), CommandPriority::Critical);
+        assert!(CommandPriority::for_request(&req).is_synchronous());
+    }
+
+    #[test]
+    fn test_query_status_is_normal_priority() {
+        let req = GatewayRequest::QueryStatus(StatusQuery {
+            execution_id: ExecutionId("exec-123".to_string()),
+        });
+        assert_eq!(CommandPriority::for_request(&req), CommandPriority::Normal);
+        assert!(!CommandPriority::for_request(&req).is_synchronous());
+    }
+
+    #[test]
+    fn test_subscribe_is_low_priority() {
+        let req = GatewayRequest::Subscribe(MarketSubscription {
+            symbol: "AAPL".to_string(),
+        });
+        assert_eq!(CommandPriority::for_request(&req), CommandPriority::Low);
+        assert!(!CommandPriority::for_request(&req).is_synchronous());
+    }
+
+    #[test]
+    fn test_unsubscribe_is_low_priority() {
+        let req = GatewayRequest::Unsubscribe(MarketSubscription {
+            symbol: "AAPL".to_string(),
+        });
+        assert_eq!(CommandPriority::for_request(&req), CommandPriority::Low);
+        assert!(!CommandPriority::for_request(&req).is_synchronous());
+    }
+
+    #[test]
+    fn test_priority_ordering() {
+        // Lower value = higher priority
+        assert!(CommandPriority::Critical < CommandPriority::Normal);
+        assert!(CommandPriority::Normal < CommandPriority::Low);
+        assert!(CommandPriority::Critical < CommandPriority::Low);
+    }
+
+    #[test]
+    fn test_bus_adapter_config_default() {
+        let config = BusAdapterConfig::default();
+        assert!(config.enable_sync_critical_path);
+        assert_eq!(config.sync_timeout_ms, 500);
+        assert_eq!(config.max_concurrent_async, 10);
+        assert_eq!(config.critical_channel_capacity, 128);
+    }
+
+    #[test]
+    fn test_bus_adapter_config_hft() {
+        let config = BusAdapterConfig::hft();
+        assert!(config.enable_sync_critical_path);
+        assert_eq!(config.sync_timeout_ms, 100);
+        assert_eq!(config.max_concurrent_async, 10);
+    }
+
+    #[test]
+    fn test_bus_adapter_config_without_sync_path() {
+        let config = BusAdapterConfig::default().without_sync_path();
+        assert!(!config.enable_sync_critical_path);
+    }
+
+    #[test]
+    fn test_execution_commands_all_critical() {
+        // Verify all execution-related commands are critical
+        let submit = GatewayRequest::SubmitOrder(OrderCmd {
+            symbol: "TEST".to_string(),
+            qty: 1,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            stop_price: None,
+            client_order_id: None,
+            extended_hours: false,
+            notional: None,
+        });
+        let cancel = GatewayRequest::CancelOrder(CancelCmd {
+            execution_id: ExecutionId("test".to_string()),
+        });
+        let replace = GatewayRequest::ReplaceOrder(ReplaceCmd {
+            execution_id: ExecutionId("test".to_string()),
+            symbol: "TEST".to_string(),
+            side: OrderSide::Sell,
+            qty: None,
+            limit_price: None,
+        });
+
+        assert!(CommandPriority::for_request(&submit).is_synchronous());
+        assert!(CommandPriority::for_request(&cancel).is_synchronous());
+        assert!(CommandPriority::for_request(&replace).is_synchronous());
+    }
+
+    #[test]
+    fn test_non_execution_commands_not_synchronous() {
+        // Verify non-execution commands are NOT synchronous
+        let query = GatewayRequest::QueryStatus(StatusQuery {
+            execution_id: ExecutionId("test".to_string()),
+        });
+        let subscribe = GatewayRequest::Subscribe(MarketSubscription {
+            symbol: "TEST".to_string(),
+        });
+        let unsubscribe = GatewayRequest::Unsubscribe(MarketSubscription {
+            symbol: "TEST".to_string(),
+        });
+
+        assert!(!CommandPriority::for_request(&query).is_synchronous());
+        assert!(!CommandPriority::for_request(&subscribe).is_synchronous());
+        assert!(!CommandPriority::for_request(&unsubscribe).is_synchronous());
+    }
 }
