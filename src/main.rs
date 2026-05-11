@@ -27,6 +27,7 @@ use crate::core::domain::market_data::MarketDataCommand;
 use tokio::sync::mpsc;
 
 use crate::core::domain::broker_config::BrokerConfig;
+use crate::core::domain::operation_mode::OperationMode;
 
 use crate::core::application::connection_manager::ConnectionManager;
 use crate::core::application::gateway_service::GatewayService;
@@ -64,6 +65,13 @@ async fn main() {
 
     // ── Config ────────────────────────────────────────────────────────────────
     let cfg = AppConfig::from_env();
+
+    // Validate configuration
+    if let Err(e) = cfg.validate() {
+        error!("Configuration validation failed: {}", e);
+        std::process::exit(1);
+    }
+
     info!(
         "config loaded: broker={} rep={} pub={} feed={} symbols={:?}",
         cfg.broker,
@@ -71,6 +79,13 @@ async fn main() {
         cfg.zmq_pub_endpoint,
         cfg.market_data_feed,
         cfg.market_data_symbols,
+    );
+    info!(
+        "operation mode: {} (workload_isolation={}, max_concurrent_bulk={}, per_workload_rate_limit={})",
+        cfg.operation_mode,
+        cfg.workload_config.isolate_bulk_operations,
+        cfg.workload_config.max_concurrent_bulk,
+        cfg.workload_config.per_workload_rate_limiting,
     );
     info!("wire codec: MessagePack only (JSON fallback removed)");
 
@@ -89,13 +104,19 @@ async fn main() {
     ));
 
     // ── Broker adapter ────────────────────────────────────────────────────────
-    let api_info = ApiInfo::from_env()
-        .expect("missing APCA_API_KEY_ID / APCA_API_SECRET_KEY / APCA_API_BASE_URL");
-    let client = Client::new(api_info);
+    let adapter: Box<dyn crate::core::ports::execution_port::IExecutionPort<Error = crate::adapters::broker::broker_error::BrokerError>> = 
+        if cfg.operation_mode == OperationMode::Offline {
+            info!("Operation mode is OFFLINE - using mock adapter without broker connectivity");
+            Box::new(crate::adapters::broker::mock_adapter::MockAdapter::default())
+        } else {
+            let api_info = ApiInfo::from_env()
+                .expect("missing APCA_API_KEY_ID / APCA_API_SECRET_KEY / APCA_API_BASE_URL");
+            let client = Client::new(api_info);
 
-    let factory = AdapterFactory::new(Some(client));
-    let adapter = factory.create_adapter(BrokerConfig { name: cfg.broker.clone() })
-        .expect("Failed to create broker adapter - Alpaca client may already be consumed");
+            let factory = AdapterFactory::new(Some(client));
+            factory.create_adapter(BrokerConfig { name: cfg.broker.clone() })
+                .expect("Failed to create broker adapter - Alpaca client may already be consumed")
+        };
 
     // ── Application services ──────────────────────────────────────────────────
     let order_submission = Arc::new(OrderSubmissionService::new(
@@ -137,13 +158,14 @@ async fn main() {
     let (order_lifecycle_publisher, order_lifecycle_handle) = OrderLifecyclePublisher::spawn(&cfg.zmq_order_lifecycle_endpoint);
 
     // ── Gateway ───────────────────────────────────────────────────────────────
-    let gateway = Arc::new(GatewayService::new(
+    let gateway = Arc::new(GatewayService::new_with_workload_config(
         order_submission,
         risk_management,
         Arc::clone(&observability),
         ConnectionManager::new(cfg.reconnect_max_attempts, cfg.reconnect_base_ms),
         stream_command_tx.clone(),
         order_lifecycle_publisher,
+        cfg.workload_config.clone(),
     ));
 
     // ── Event reactor for symbol-specific market data handling ────────────────
@@ -155,18 +177,28 @@ async fn main() {
     );
 
     // ── Alpaca market data stream ─────────────────────────────────────────────
-    let stream_config = AlpacaStreamConfig::from_env(
-        cfg.market_data_feed.clone(),
-        cfg.market_data_symbols.clone(),
-    );
-    let stream_handle = alpaca_stream::spawn(
-        stream_config,
-        publisher.clone(),
-        reactor_tx.clone(),
-        Arc::clone(&stream_connection_manager),
-        stream_command_rx,
-        Arc::clone(&observability),
-    );
+    // Skip market data stream in offline mode
+    let stream_handle: Option<tokio::task::JoinHandle<()>> = if cfg.operation_mode == OperationMode::Offline {
+        info!("Operation mode is OFFLINE - skipping market data stream");
+        // Create a dummy task that does nothing
+        Some(tokio::spawn(async move {
+            // Keep the stream_command_rx alive but don't use it
+            drop(stream_command_rx);
+        }))
+    } else {
+        let stream_config = AlpacaStreamConfig::from_env(
+            cfg.market_data_feed.clone(),
+            cfg.market_data_symbols.clone(),
+        );
+        Some(alpaca_stream::spawn(
+            stream_config,
+            publisher.clone(),
+            reactor_tx.clone(),
+            Arc::clone(&stream_connection_manager),
+            stream_command_rx,
+            Arc::clone(&observability),
+        ))
+    };
 
     // ── ZeroMQ REP listener ───────────────────────────────────────────────────
     let bus = BusAdapter::new(
@@ -186,6 +218,7 @@ async fn main() {
     );
 
     // Run all four concurrently; stop if any fails
+    // In offline mode, stream_handle is a dummy task that completes immediately
     tokio::select! {
         result = bus.listen() => {
             if let Err(e) = result {
@@ -205,7 +238,11 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        _ = stream_handle => {
+        _ = async {
+            if let Some(handle) = stream_handle {
+                handle.await.ok();
+            }
+        } => {
             error!("Market data stream task exited unexpectedly");
             std::process::exit(1);
         }

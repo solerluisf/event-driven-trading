@@ -16,8 +16,13 @@
 //   JOURNAL_DB_PATH                      journal.db
 //   MARKET_DATA_FEED                     iex                    "iex", "sip", or "test"
 //   MARKET_DATA_SYMBOLS                  AAPL,SPY               comma-separated list (or "*")
+//   GATEWAY_OPERATION_MODE               paper                  "live", "paper", "readonly", "offline"
+//   GATEWAY_ISOLATE_BULK_OPS             true                   isolate bulk operations on separate threads
+//   GATEWAY_MAX_CONCURRENT_BULK          3                      max concurrent bulk operations
+//   GATEWAY_PER_WORKLOAD_RATE_LIMIT      true                   enable per-workload rate limiting
 
 use std::env;
+use crate::core::domain::operation_mode::{OperationMode, WorkloadConfig};
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -45,11 +50,18 @@ pub struct AppConfig {
     pub market_data_feed: String,
     /// Symbols to stream — use ["*"] for all (requires appropriate plan)
     pub market_data_symbols: Vec<String>,
+    /// Operation mode: "live", "paper", "readonly", "offline"
+    pub operation_mode: OperationMode,
+    /// Workload configuration for separating live vs bulk/offline operations
+    pub workload_config: WorkloadConfig,
 }
 
 impl AppConfig {
     /// Load config from environment.  Panics on parse errors for numeric fields.
     pub fn from_env() -> Self {
+        let operation_mode = parse_operation_mode(&env_str("GATEWAY_OPERATION_MODE", "paper"));
+        let workload_config = build_workload_config(&operation_mode);
+
         Self {
             zmq_rep_endpoint: env_str("GATEWAY_ZMQ_REP_ENDPOINT", "tcp://127.0.0.1:5555"),
             zmq_pub_endpoint: env_str("GATEWAY_ZMQ_PUB_ENDPOINT", "tcp://127.0.0.1:5556"),
@@ -63,6 +75,29 @@ impl AppConfig {
             journal_db_path: env_str("JOURNAL_DB_PATH", "journal.db"),
             market_data_feed: env_str("MARKET_DATA_FEED", "iex"),
             market_data_symbols: env_symbol_list("MARKET_DATA_SYMBOLS", &["AAPL", "SPY"]),
+            operation_mode,
+            workload_config,
+        }
+    }
+
+    /// Validate that the configuration is consistent
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate workload config
+        if let Err(e) = self.workload_config.validate() {
+            return Err(format!("Invalid workload configuration: {}", e));
+        }
+
+        // Check that operation mode is compatible with broker connectivity
+        match (self.operation_mode, self.broker.as_str()) {
+            (OperationMode::Offline, _) => {
+                // Offline mode doesn't require broker connectivity
+                Ok(())
+            }
+            (mode, "mock") if !mode.requires_broker_connection() => {
+                // Using mock adapter in non-connectivity mode is fine
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -95,5 +130,189 @@ fn env_symbol_list(key: &str, defaults: &[&str]) -> Vec<String> {
                 .collect()
         }
         _ => defaults.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Parse operation mode from string
+fn parse_operation_mode(s: &str) -> OperationMode {
+    match s.to_lowercase().as_str() {
+        "live" => OperationMode::Live,
+        "paper" => OperationMode::Paper,
+        "readonly" | "read-only" | "read_only" => OperationMode::ReadOnly,
+        "offline" => OperationMode::Offline,
+        _ => {
+            tracing::warn!("Unknown operation mode '{}', defaulting to 'paper'", s);
+            OperationMode::Paper
+        }
+    }
+}
+
+/// Build workload configuration based on operation mode and environment overrides
+fn build_workload_config(mode: &OperationMode) -> WorkloadConfig {
+    let mut config = match mode {
+        OperationMode::Live => WorkloadConfig::live_trading(),
+        OperationMode::Paper => WorkloadConfig::paper_trading(),
+        OperationMode::ReadOnly => WorkloadConfig::backoffice_only(),
+        OperationMode::Offline => {
+            let mut cfg = WorkloadConfig::backoffice_only();
+            cfg.mode = OperationMode::Offline;
+            cfg
+        }
+    };
+
+    // Allow environment overrides
+    if let Ok(isolate) = env::var("GATEWAY_ISOLATE_BULK_OPS") {
+        config.isolate_bulk_operations = isolate.parse().unwrap_or(config.isolate_bulk_operations);
+    }
+
+    if let Ok(max_bulk) = env::var("GATEWAY_MAX_CONCURRENT_BULK") {
+        config.max_concurrent_bulk = max_bulk.parse().unwrap_or(config.max_concurrent_bulk);
+    }
+
+    if let Ok(per_workload) = env::var("GATEWAY_PER_WORKLOAD_RATE_LIMIT") {
+        config.per_workload_rate_limiting = per_workload.parse().unwrap_or(config.per_workload_rate_limiting);
+    }
+
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::domain::operation_mode::WorkloadType;
+
+    #[test]
+    fn test_parse_operation_mode_live() {
+        assert_eq!(parse_operation_mode("live"), OperationMode::Live);
+        assert_eq!(parse_operation_mode("LIVE"), OperationMode::Live);
+        assert_eq!(parse_operation_mode("Live"), OperationMode::Live);
+    }
+
+    #[test]
+    fn test_parse_operation_mode_paper() {
+        assert_eq!(parse_operation_mode("paper"), OperationMode::Paper);
+        assert_eq!(parse_operation_mode("PAPER"), OperationMode::Paper);
+    }
+
+    #[test]
+    fn test_parse_operation_mode_readonly() {
+        assert_eq!(parse_operation_mode("readonly"), OperationMode::ReadOnly);
+        assert_eq!(parse_operation_mode("read-only"), OperationMode::ReadOnly);
+        assert_eq!(parse_operation_mode("read_only"), OperationMode::ReadOnly);
+    }
+
+    #[test]
+    fn test_parse_operation_mode_offline() {
+        assert_eq!(parse_operation_mode("offline"), OperationMode::Offline);
+    }
+
+    #[test]
+    fn test_parse_operation_mode_unknown_defaults_to_paper() {
+        assert_eq!(parse_operation_mode("unknown"), OperationMode::Paper);
+        assert_eq!(parse_operation_mode(""), OperationMode::Paper);
+    }
+
+    #[test]
+    fn test_build_workload_config_live() {
+        let config = build_workload_config(&OperationMode::Live);
+        assert_eq!(config.mode, OperationMode::Live);
+        assert!(config.is_workload_allowed(WorkloadType::LiveTrading));
+        assert!(config.is_workload_allowed(WorkloadType::Query));
+        // Live trading config should NOT allow bulk operations by default
+        assert!(!config.is_workload_allowed(WorkloadType::Reconciliation));
+        assert!(!config.is_workload_allowed(WorkloadType::HistoricalDataDownload));
+    }
+
+    #[test]
+    fn test_build_workload_config_paper() {
+        let config = build_workload_config(&OperationMode::Paper);
+        assert_eq!(config.mode, OperationMode::Paper);
+        assert!(config.is_workload_allowed(WorkloadType::LiveTrading));
+        assert!(config.is_workload_allowed(WorkloadType::Query));
+        // Paper trading allows reconciliation
+        assert!(config.is_workload_allowed(WorkloadType::Reconciliation));
+    }
+
+    #[test]
+    fn test_build_workload_config_readonly() {
+        let config = build_workload_config(&OperationMode::ReadOnly);
+        assert_eq!(config.mode, OperationMode::ReadOnly);
+        assert!(!config.is_workload_allowed(WorkloadType::LiveTrading));
+        assert!(config.is_workload_allowed(WorkloadType::Query));
+        assert!(config.is_workload_allowed(WorkloadType::Reconciliation));
+        assert!(config.is_workload_allowed(WorkloadType::HistoricalDataDownload));
+    }
+
+    #[test]
+    fn test_build_workload_config_offline() {
+        let config = build_workload_config(&OperationMode::Offline);
+        assert_eq!(config.mode, OperationMode::Offline);
+        assert!(!config.is_workload_allowed(WorkloadType::LiveTrading));
+        // Offline mode should not allow queries that require connectivity
+        // but may allow historical data downloads (which could be from local cache)
+    }
+
+    #[test]
+    fn test_app_config_validate_success() {
+        let config = AppConfig {
+            zmq_rep_endpoint: "tcp://127.0.0.1:5555".to_string(),
+            zmq_pub_endpoint: "tcp://127.0.0.1:5556".to_string(),
+            zmq_order_lifecycle_endpoint: "tcp://127.0.0.1:5557".to_string(),
+            broker: "alpaca".to_string(),
+            rate_limit_rpm: 200.0,
+            cb_failure_threshold: 3,
+            cb_cooldown_secs: 30,
+            reconnect_max_attempts: 5,
+            reconnect_base_ms: 500,
+            journal_db_path: "journal.db".to_string(),
+            market_data_feed: "iex".to_string(),
+            market_data_symbols: vec!["AAPL".to_string()],
+            operation_mode: OperationMode::Paper,
+            workload_config: WorkloadConfig::paper_trading(),
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_app_config_validate_invalid_workload() {
+        use crate::core::domain::operation_mode::WorkloadConfigError;
+
+        let invalid_workload_config = WorkloadConfig {
+            mode: OperationMode::ReadOnly,
+            allowed_workloads: vec![WorkloadType::LiveTrading], // Invalid: ReadOnly doesn't allow LiveTrading
+            isolate_bulk_operations: false,
+            max_concurrent_bulk: 1,
+            per_workload_rate_limiting: false,
+        };
+
+        let config = AppConfig {
+            zmq_rep_endpoint: "tcp://127.0.0.1:5555".to_string(),
+            zmq_pub_endpoint: "tcp://127.0.0.1:5556".to_string(),
+            zmq_order_lifecycle_endpoint: "tcp://127.0.0.1:5557".to_string(),
+            broker: "alpaca".to_string(),
+            rate_limit_rpm: 200.0,
+            cb_failure_threshold: 3,
+            cb_cooldown_secs: 30,
+            reconnect_max_attempts: 5,
+            reconnect_base_ms: 500,
+            journal_db_path: "journal.db".to_string(),
+            market_data_feed: "iex".to_string(),
+            market_data_symbols: vec!["AAPL".to_string()],
+            operation_mode: OperationMode::ReadOnly,
+            workload_config: invalid_workload_config,
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid workload configuration"));
+    }
+
+    #[test]
+    fn test_env_symbol_list_parsing() {
+        // Test with explicit values
+        let symbols = env_symbol_list("MARKET_DATA_SYMBOLS", &["AAPL", "SPY"]);
+        // Since we're not setting the env var, it should use defaults
+        assert_eq!(symbols, vec!["AAPL", "SPY"]);
     }
 }

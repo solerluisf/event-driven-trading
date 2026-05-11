@@ -18,6 +18,7 @@ use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, E
 use crate::core::domain::journal::{RequestRecord, ResponseRecord};
 use crate::core::ports::market_data_port::IMarketDataPort;
 use crate::adapters::broker::broker_error::BrokerError;
+use crate::core::domain::operation_mode::{WorkloadConfig, WorkloadType, validate_request_for_mode};
 use tokio::sync::mpsc::Sender;
 
 pub struct GatewayService {
@@ -27,6 +28,7 @@ pub struct GatewayService {
     connection_manager: ConnectionManager,
     stream_command_tx: Sender<MarketDataCommand>,
     order_lifecycle_publisher: OrderLifecyclePublisher,
+    workload_config: WorkloadConfig,
 }
 
 impl GatewayService {
@@ -45,10 +47,60 @@ impl GatewayService {
             connection_manager,
             stream_command_tx,
             order_lifecycle_publisher,
+            workload_config: WorkloadConfig::default(),
         }
     }
 
+    /// Create a new GatewayService with workload configuration for operation mode separation
+    pub fn new_with_workload_config(
+        order_submission: Arc<dyn IOrderSubmissionService>,
+        risk_management:  Arc<dyn IRiskManagementService>,
+        observability:    Arc<dyn IObservabilityService>,
+        connection_manager: ConnectionManager,
+        stream_command_tx: Sender<MarketDataCommand>,
+        order_lifecycle_publisher: OrderLifecyclePublisher,
+        workload_config: WorkloadConfig,
+    ) -> Self {
+        Self {
+            order_submission,
+            risk_management,
+            observability,
+            connection_manager,
+            stream_command_tx,
+            order_lifecycle_publisher,
+            workload_config,
+        }
+    }
+
+    /// Validate that a workload type is allowed in the current configuration
+    fn validate_workload(&self, workload: WorkloadType) -> Result<(), BrokerError> {
+        // First check if workload is allowed in config
+        if !self.workload_config.is_workload_allowed(workload) {
+            return Err(BrokerError::Unknown(format!(
+                "Workload {} is not allowed in current configuration",
+                workload
+            )));
+        }
+
+        // Then validate against operation mode
+        if let Err(e) = validate_request_for_mode(
+            self.workload_config.mode,
+            &self.workload_config,
+            workload,
+        ) {
+            return Err(BrokerError::Unknown(format!(
+                "Workload validation failed: {}",
+                e
+            )));
+        }
+
+        Ok(())
+    }
+
     pub async fn submit_order(&self, cmd: OrderCmd) -> Result<ExecutionId, BrokerError> {
+        // Validate workload is allowed
+        self.validate_workload(WorkloadType::LiveTrading)?;
+
         // Risk check (kill switch + rate limit) before anything else
         self.risk_management.check(&cmd.symbol, 1)?;
 
@@ -95,6 +147,9 @@ impl GatewayService {
     }
 
     pub async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), BrokerError> {
+        // Validate workload is allowed (cancel is part of LiveTrading workload)
+        self.validate_workload(WorkloadType::LiveTrading)?;
+
         self.risk_management.check(&cmd.execution_id.0, 1)?;
         
         // Journal the outbound intent BEFORE executing
@@ -127,6 +182,9 @@ impl GatewayService {
     }
 
     pub async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), BrokerError> {
+        // Validate workload is allowed (replace is part of LiveTrading workload)
+        self.validate_workload(WorkloadType::LiveTrading)?;
+
         self.risk_management.check(&cmd.execution_id.0, 1)?;
         
         // Journal the outbound intent BEFORE executing
@@ -168,6 +226,9 @@ impl GatewayService {
     }
 
     pub async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
+        // Validate workload is allowed
+        self.validate_workload(WorkloadType::Query)?;
+
         // Note: query_status is a read-only operation, but we still track it for observability
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: query.execution_id.0.clone(),
@@ -195,6 +256,9 @@ impl GatewayService {
     }
 
     pub async fn subscribe(&self, sub: MarketSubscription) -> Result<(), BrokerError> {
+        // Validate workload is allowed
+        self.validate_workload(WorkloadType::MarketDataStreaming)?;
+
         // Journal the outbound intent BEFORE executing
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: sub.symbol.clone(),
@@ -212,6 +276,9 @@ impl GatewayService {
     }
 
     pub async fn unsubscribe(&self, sub: MarketSubscription) -> Result<(), BrokerError> {
+        // Validate workload is allowed
+        self.validate_workload(WorkloadType::MarketDataStreaming)?;
+
         // Journal the outbound intent BEFORE executing
         if let Err(e) = self.observability.record_outbound(RequestRecord {
             id: sub.symbol.clone(),
