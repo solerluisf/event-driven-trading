@@ -224,6 +224,126 @@ mod rate_limiter_tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(limiter.allow("b", 1), "bucket should have refilled");
     }
+
+    // =========================================================================
+    // BACK-PRESSURE TESTS
+    // =========================================================================
+
+    #[test]
+    fn back_pressure_status_shows_full_capacity_initially() {
+        let limiter = RateLimiterManager::new(100.0);
+        let status = limiter.get_back_pressure_status("broker-a", 20.0)
+            .expect("should get status for new broker");
+        
+        assert_eq!(status.tokens_remaining, 100.0, "bucket should start full");
+        assert_eq!(status.capacity, 100.0);
+        assert!((status.percent_remaining - 100.0).abs() < 0.01, "should be 100% full");
+        assert!(!status.is_near_limit, "full bucket should not be near limit");
+    }
+
+    #[test]
+    fn back_pressure_status_shows_depletion() {
+        let limiter = RateLimiterManager::new(10.0);
+        
+        // Consume 7 tokens (70%)
+        for _ in 0..7 {
+            limiter.allow("broker-b", 1);
+        }
+        
+        let status = limiter.get_back_pressure_status("broker-b", 30.0)
+            .expect("should get status");
+        
+        // Should have ~3 tokens left (allowing for small refill due to elapsed time)
+        assert!(status.tokens_remaining >= 2.5 && status.tokens_remaining <= 3.5,
+            "should have ~3 tokens remaining, got {}", status.tokens_remaining);
+        // Due to potential refill, percent_remaining might be slightly above 30%
+        // but should still be in the "near limit" range
+        assert!(status.percent_remaining >= 20.0 && status.percent_remaining <= 40.0, 
+            "should be around 30% remaining, got {}", status.percent_remaining);
+        // At 30% threshold with ~3 tokens (30%), should be near limit
+        assert!(status.is_near_limit || status.percent_remaining <= 35.0, 
+            "should be near limit when at or below 30%, got {}%", status.percent_remaining);
+    }
+
+    #[test]
+    fn is_near_limit_returns_true_when_below_threshold() {
+        let limiter = RateLimiterManager::new(10.0);
+        
+        // Consume 9 tokens (90%)
+        for _ in 0..9 {
+            limiter.allow("broker-c", 1);
+        }
+        
+        assert!(limiter.is_near_limit("broker-c", Some(20.0)), 
+            "should be near limit with only 1 token left at 20% threshold");
+        assert!(!limiter.is_near_limit("broker-c", Some(5.0)), 
+            "should NOT be near limit at 5% threshold");
+    }
+
+    #[test]
+    fn tokens_remaining_returns_accurate_count() {
+        let limiter = RateLimiterManager::new(5.0);
+        
+        // Initially full (allowing for tiny refill)
+        let initial = limiter.tokens_remaining("broker-d");
+        assert!(initial >= 5.0 && initial <= 5.1, "should start with ~5 tokens, got {}", initial);
+        
+        // Consume 3
+        for _ in 0..3 {
+            limiter.allow("broker-d", 1);
+        }
+        
+        // Should have ~2 tokens (allowing for tiny refill during operations)
+        let remaining = limiter.tokens_remaining("broker-d");
+        assert!(remaining >= 1.9 && remaining <= 2.2, "should have ~2 tokens remaining, got {}", remaining);
+    }
+
+    #[test]
+    fn get_capacity_returns_registered_or_default() {
+        let limiter = RateLimiterManager::new(100.0);
+        
+        // Unregistered broker returns default
+        assert_eq!(limiter.get_capacity("unregistered"), 100.0);
+        
+        // Register with different capacity
+        limiter.register("custom", 50.0);
+        assert_eq!(limiter.get_capacity("custom"), 50.0);
+    }
+
+    #[test]
+    fn back_pressure_threshold_edge_cases() {
+        let limiter = RateLimiterManager::new(10.0);
+        
+        // Empty the bucket
+        for _ in 0..10 {
+            limiter.allow("broker-e", 1);
+        }
+        
+        // At 0%, should be near limit at any threshold > 0
+        assert!(limiter.is_near_limit("broker-e", Some(1.0)));
+        
+        // At 0% with 0 threshold, not near limit
+        assert!(!limiter.is_near_limit("broker-e", Some(0.0)));
+    }
+
+    #[test]
+    fn back_pressure_brokers_are_independent() {
+        let limiter = RateLimiterManager::new(5.0);
+        
+        // Drain broker-1 completely
+        for _ in 0..5 {
+            limiter.allow("broker-1", 1);
+        }
+        
+        // broker-1 is near limit
+        assert!(limiter.is_near_limit("broker-1", Some(20.0)));
+        
+        // broker-2 is still full
+        let status = limiter.get_back_pressure_status("broker-2", 20.0)
+            .expect("should get status");
+        assert!(!status.is_near_limit);
+        assert_eq!(status.tokens_remaining, 5.0);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

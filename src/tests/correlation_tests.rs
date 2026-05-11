@@ -173,6 +173,7 @@ mod correlation_tests {
         let payload = ResponsePayload {
             correlation_id: correlation_id.clone(),
             result: "success".to_string(),
+            back_pressure: None,
         };
 
         assert_eq!(payload.correlation_id, correlation_id);
@@ -195,6 +196,7 @@ mod correlation_tests {
         let resp = GatewayResponse::Ok(ResponsePayload {
             correlation_id: Some("serialization-test".to_string()),
             result: "exec-123".to_string(),
+            back_pressure: None,
         });
 
         let encoded = serde_json::to_vec(&resp).expect("encode should succeed");
@@ -308,6 +310,7 @@ mod correlation_tests {
         let response = GatewayResponse::Ok(ResponsePayload {
             correlation_id: extracted_correlation,
             result: "exec-nvda-123".to_string(),
+            back_pressure: None,
         });
 
         // 6. Encode and decode response

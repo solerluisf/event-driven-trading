@@ -8,6 +8,36 @@ use serde::{Deserialize, Serialize};
 use crate::core::domain::market_data::MarketSubscription;
 use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery};
 
+/// Back-pressure information included in responses when broker quota is near.
+/// This signals to the Execution Service that it should slow down.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct BackPressureInfo {
+    /// Broker ID that is near its quota.
+    pub broker_id: String,
+    /// Current token count remaining.
+    pub tokens_remaining: f64,
+    /// Maximum token capacity.
+    pub capacity: f64,
+    /// Percentage of capacity remaining (0.0 - 100.0).
+    pub percent_remaining: f64,
+    /// True if the broker is near its rate limit.
+    pub is_near_limit: bool,
+    /// Recommended action for the Execution Service.
+    pub recommendation: BackPressureRecommendation,
+}
+
+/// Recommendation for the Execution Service on how to handle back-pressure.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackPressureRecommendation {
+    /// Continue normal operation.
+    Normal,
+    /// Slow down request rate.
+    SlowDown,
+    /// Pause sending requests temporarily.
+    Pause,
+}
+
 // ── Inbound (Execution Service → Gateway) ────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -38,6 +68,10 @@ pub struct ResponsePayload {
     pub correlation_id: Option<String>,
     /// Human-readable result or execution ID.
     pub result: String,
+    /// Optional back-pressure information when broker quota is near.
+    /// When present, the Execution Service should adjust its request rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub back_pressure: Option<BackPressureInfo>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

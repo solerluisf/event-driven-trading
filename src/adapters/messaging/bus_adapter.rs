@@ -19,8 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 use zmq::Context;
 
 use crate::core::application::gateway_service::GatewayService;
+use crate::core::application::rate_limiter::RateLimiterManager;
 use crate::core::domain::wire_message::{
-    GatewayRequest, GatewayResponse, ResponsePayload, ErrorPayload,
+    GatewayRequest, GatewayResponse, ResponsePayload, ErrorPayload, BackPressureInfo, BackPressureRecommendation,
 };
 use super::wire_codec::{
     decode_gateway_request, encode_gateway_response,
@@ -34,18 +35,71 @@ struct ZmqMessage {
     response_tx: oneshot::Sender<Vec<u8>>,
 }
 
+/// Default threshold percentage for considering broker near limit (20%).
+pub const DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT: f64 = 20.0;
+
 pub struct BusAdapter {
     /// ZeroMQ endpoint string, e.g. "tcp://127.0.0.1:5555"
     endpoint: String,
     gateway: Arc<GatewayService>,
+    /// Rate limiter for checking back-pressure status.
+    rate_limiter: Arc<RateLimiterManager>,
+    /// Broker ID for rate limiting and back-pressure.
+    broker_id: String,
+    /// Threshold percentage below which broker is considered near limit.
+    near_limit_threshold_percent: f64,
 }
 
 impl BusAdapter {
-    pub fn new(endpoint: impl Into<String>, gateway: Arc<GatewayService>) -> Self {
+    pub fn new(
+        endpoint: impl Into<String>,
+        gateway: Arc<GatewayService>,
+        rate_limiter: Arc<RateLimiterManager>,
+        broker_id: impl Into<String>,
+    ) -> Self {
         Self {
             endpoint: endpoint.into(),
             gateway,
+            rate_limiter,
+            broker_id: broker_id.into(),
+            near_limit_threshold_percent: DEFAULT_NEAR_LIMIT_THRESHOLD_PERCENT,
         }
+    }
+
+    /// Set the threshold percentage for considering broker near limit.
+    /// Default is 20% - when remaining tokens fall below 20% of capacity,
+    /// back-pressure will be signaled.
+    pub fn with_near_limit_threshold(mut self, threshold_percent: f64) -> Self {
+        self.near_limit_threshold_percent = threshold_percent.clamp(0.0, 100.0);
+        self
+    }
+
+    /// Build back-pressure information if the broker is near its limit.
+    fn build_back_pressure_info(&self) -> Option<BackPressureInfo> {
+        let status = self.rate_limiter
+            .get_back_pressure_status(&self.broker_id, self.near_limit_threshold_percent)?;
+        
+        // Only include back-pressure info if near limit
+        if !status.is_near_limit {
+            return None;
+        }
+
+        let recommendation = if status.percent_remaining < 5.0 {
+            BackPressureRecommendation::Pause
+        } else if status.percent_remaining < self.near_limit_threshold_percent {
+            BackPressureRecommendation::SlowDown
+        } else {
+            BackPressureRecommendation::Normal
+        };
+
+        Some(BackPressureInfo {
+            broker_id: self.broker_id.clone(),
+            tokens_remaining: status.tokens_remaining,
+            capacity: status.capacity,
+            percent_remaining: status.percent_remaining,
+            is_near_limit: status.is_near_limit,
+            recommendation,
+        })
     }
 
     /// Bind the REP socket and loop forever processing commands.
@@ -274,6 +328,9 @@ impl BusAdapter {
 
     /// Route a deserialized request to the correct GatewayService method.
     async fn dispatch(&self, req: GatewayRequest, gateway: &GatewayService) -> GatewayResponse {
+        // Get back-pressure info before processing (will be None if not near limit)
+        let back_pressure = self.build_back_pressure_info();
+
         match req {
             GatewayRequest::SubmitOrder(cmd) => {
                 // Use explicit correlation_id if provided, fall back to client_order_id
@@ -282,6 +339,7 @@ impl BusAdapter {
                     Ok(exec_id) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: exec_id.0,
+                        back_pressure,
                     }),
                     Err(e) => GatewayResponse::Err(ErrorPayload {
                         correlation_id,
@@ -298,6 +356,7 @@ impl BusAdapter {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "cancelled".into(),
+                        back_pressure,
                     }),
                     Err(e) => GatewayResponse::Err(ErrorPayload {
                         correlation_id,
@@ -314,6 +373,7 @@ impl BusAdapter {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "replaced".into(),
+                        back_pressure,
                     }),
                     Err(e) => GatewayResponse::Err(ErrorPayload {
                         correlation_id,
@@ -334,6 +394,7 @@ impl BusAdapter {
                         GatewayResponse::Ok(ResponsePayload {
                             correlation_id,
                             result: result_json,
+                            back_pressure,
                         })
                     }
                     Err(e) => GatewayResponse::Err(ErrorPayload {
@@ -351,6 +412,7 @@ impl BusAdapter {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "subscribed".into(),
+                        back_pressure,
                     }),
                     Err(e) => GatewayResponse::Err(ErrorPayload {
                         correlation_id,
@@ -367,6 +429,7 @@ impl BusAdapter {
                     Ok(()) => GatewayResponse::Ok(ResponsePayload {
                         correlation_id,
                         result: "unsubscribed".into(),
+                        back_pressure,
                     }),
                     Err(e) => GatewayResponse::Err(ErrorPayload {
                         correlation_id,
@@ -688,5 +751,126 @@ mod tests {
         assert!(!CommandPriority::for_request(&query).is_synchronous());
         assert!(!CommandPriority::for_request(&subscribe).is_synchronous());
         assert!(!CommandPriority::for_request(&unsubscribe).is_synchronous());
+    }
+
+    // =========================================================================
+    // BACK-PRESSURE TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_bus_adapter_includes_back_pressure_when_near_limit() {
+        let gateway = make_test_gateway();
+        let rate_limiter = Arc::new(RateLimiterManager::new(10.0));
+        let adapter = BusAdapter::new(
+            "tcp://127.0.0.1:0",
+            gateway,
+            rate_limiter.clone(),
+            "test-broker",
+        ).with_near_limit_threshold(30.0);
+
+        // Consume 8 tokens (80% used, 20% remaining - below 30% threshold)
+        for _ in 0..8 {
+            rate_limiter.allow("test-broker", 1);
+        }
+
+        let back_pressure = adapter.build_back_pressure_info();
+        assert!(back_pressure.is_some(), "should have back-pressure when near limit");
+        
+        let info = back_pressure.unwrap();
+        assert_eq!(info.broker_id, "test-broker");
+        assert!(info.is_near_limit);
+        assert!(info.percent_remaining <= 30.0);
+    }
+
+    #[test]
+    fn test_bus_adapter_no_back_pressure_when_tokens_abundant() {
+        let gateway = make_test_gateway();
+        let rate_limiter = Arc::new(RateLimiterManager::new(100.0));
+        let adapter = BusAdapter::new(
+            "tcp://127.0.0.1:0",
+            gateway,
+            rate_limiter.clone(),
+            "test-broker",
+        );
+
+        // Bucket is full (100 tokens), should not trigger back-pressure
+        let back_pressure = adapter.build_back_pressure_info();
+        assert!(back_pressure.is_none(), "should not have back-pressure when tokens abundant");
+    }
+
+    #[test]
+    fn test_back_pressure_recommendation_pause_at_critical() {
+        let gateway = make_test_gateway();
+        let rate_limiter = Arc::new(RateLimiterManager::new(100.0));
+        let adapter = BusAdapter::new(
+            "tcp://127.0.0.1:0",
+            gateway,
+            rate_limiter.clone(),
+            "test-broker",
+        ).with_near_limit_threshold(20.0);
+
+        // Consume 96 tokens (only 4% remaining - critical)
+        for _ in 0..96 {
+            rate_limiter.allow("test-broker", 1);
+        }
+
+        let back_pressure = adapter.build_back_pressure_info();
+        assert!(back_pressure.is_some());
+        
+        let info = back_pressure.unwrap();
+        assert_eq!(info.recommendation, BackPressureRecommendation::Pause);
+    }
+
+    #[test]
+    fn test_back_pressure_recommendation_slow_down_at_moderate() {
+        let gateway = make_test_gateway();
+        let rate_limiter = Arc::new(RateLimiterManager::new(100.0));
+        let adapter = BusAdapter::new(
+            "tcp://127.0.0.1:0",
+            gateway,
+            rate_limiter.clone(),
+            "test-broker",
+        ).with_near_limit_threshold(30.0);
+
+        // Consume 80 tokens (20% remaining - moderate, below 30% threshold)
+        for _ in 0..80 {
+            rate_limiter.allow("test-broker", 1);
+        }
+
+        let back_pressure = adapter.build_back_pressure_info();
+        assert!(back_pressure.is_some());
+        
+        let info = back_pressure.unwrap();
+        assert_eq!(info.recommendation, BackPressureRecommendation::SlowDown);
+    }
+
+    #[test]
+    fn test_near_limit_threshold_clamping() {
+        let gateway = make_test_gateway();
+        let rate_limiter = Arc::new(RateLimiterManager::new(100.0));
+        
+        let adapter1 = BusAdapter::new(
+            "tcp://127.0.0.1:0",
+            gateway.clone(),
+            rate_limiter.clone(),
+            "test",
+        ).with_near_limit_threshold(150.0); // Above 100
+        
+        // Should be clamped to 100
+        let back_pressure1 = adapter1.build_back_pressure_info();
+        // Full bucket, so no back-pressure
+        assert!(back_pressure1.is_none());
+
+        let adapter2 = BusAdapter::new(
+            "tcp://127.0.0.1:0",
+            gateway.clone(),
+            rate_limiter.clone(),
+            "test",
+        ).with_near_limit_threshold(-10.0); // Below 0
+        
+        // Should be clamped to 0
+        // Full bucket at 100% > 0%, so no back-pressure
+        let back_pressure2 = adapter2.build_back_pressure_info();
+        assert!(back_pressure2.is_none());
     }
 }

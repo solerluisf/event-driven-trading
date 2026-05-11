@@ -56,7 +56,7 @@ fn free_tcp_port() -> u16 {
     port
 }
 
-fn make_gateway_service() -> GatewayService {
+fn make_gateway_service() -> (GatewayService, Arc<RateLimiterManager>) {
     let (stream_tx, mut stream_rx) = mpsc::channel::<MarketDataCommand>(32);
     tokio::spawn(async move {
         while stream_rx.recv().await.is_some() {}
@@ -66,19 +66,22 @@ fn make_gateway_service() -> GatewayService {
     let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
     let order_lifecycle_publisher = OrderLifecyclePublisher::from_sender(lifecycle_tx);
 
+    // Create shared rate limiter for both service and bus adapter
+    let rate_limiter = Arc::new(RateLimiterManager::new(200.0));
+
     let order_submission = Arc::new(OrderSubmissionService::new(
         RequestValidator,
         IdempotencyStore::default(),
         Box::new(MockAdapter::default()),
         Arc::new(KillSwitch::default()),
-        Arc::new(RateLimiterManager::new(200.0)),
+        Arc::clone(&rate_limiter),
         Arc::new(CircuitBreaker::new("test", 3, 30, noop_obs())),
         "test",
     )) as Arc<dyn IOrderSubmissionService>;
 
     let risk_management = Arc::new(RiskManagementService::new(
         KillSwitch::default(),
-        Arc::new(RateLimiterManager::new(200.0)),
+        Arc::clone(&rate_limiter),
     )) as Arc<dyn IRiskManagementService>;
 
     let observability = Arc::new(ObservabilityService::new(
@@ -87,21 +90,24 @@ fn make_gateway_service() -> GatewayService {
         Arc::new(MockJournalRepo),
     )) as Arc<dyn IObservabilityService>;
 
-    GatewayService::new(
+    let gateway = GatewayService::new(
         order_submission,
         risk_management,
         observability,
         ConnectionManager::new(5, 500),
         stream_tx,
         order_lifecycle_publisher,
-    )
+    );
+
+    (gateway, rate_limiter)
 }
 
 #[tokio::test]
 async fn req_rep_round_trip_uses_msgpack_wire_codec() {
     let endpoint = format!("tcp://127.0.0.1:{}", free_tcp_port());
-    let gateway = Arc::new(make_gateway_service());
-    let bus = BusAdapter::new(endpoint.clone(), gateway);
+    let (gateway, rate_limiter) = make_gateway_service();
+    let gateway = Arc::new(gateway);
+    let bus = BusAdapter::new(endpoint.clone(), gateway, rate_limiter, "test");
 
     let bus_task = tokio::spawn(async move {
         let _ = bus.listen_once().await;
@@ -121,6 +127,7 @@ async fn req_rep_round_trip_uses_msgpack_wire_codec() {
 
         let request = GatewayRequest::Subscribe(MarketSubscription {
             symbol: "TSLA".to_string(),
+            correlation_id: None,
         });
         let request_bytes = encode_gateway_request(&request).expect("encode msgpack request");
         socket.send(request_bytes, 0).expect("send request");
@@ -134,6 +141,6 @@ async fn req_rep_round_trip_uses_msgpack_wire_codec() {
 
     assert!(matches!(
         response,
-        GatewayResponse::Ok(payload) if payload.result == "subscribed"
-    ));
+        GatewayResponse::Ok(payload) if payload.result == "subscribed" && payload.back_pressure.is_none()
+    ), "Expected successful response without back-pressure when tokens are abundant");
 }

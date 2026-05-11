@@ -169,7 +169,12 @@ async fn main() {
     );
 
     // ── ZeroMQ REP listener ───────────────────────────────────────────────────
-    let bus = BusAdapter::new(&cfg.zmq_rep_endpoint, Arc::clone(&gateway));
+    let bus = BusAdapter::new(
+        &cfg.zmq_rep_endpoint,
+        Arc::clone(&gateway),
+        Arc::clone(&rate_limiter),
+        &cfg.broker,
+    );
 
     info!("Broker Gateway Service started");
     let initial_wire_metrics = wire_codec_metrics_snapshot();
