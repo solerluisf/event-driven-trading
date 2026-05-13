@@ -5,11 +5,16 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use crate::core::domain::order::ExecutionId;
 use crate::adapters::broker::broker_error::BrokerError;
 
 /// Type alias for the cancel callback function
 type CancelCallback = Arc<dyn Fn(ExecutionId) + Send + Sync>;
+
+/// Channel sender for async cancel operations
+#[derive(Clone)]
+pub struct CancelChannel(Sender<ExecutionId>);
 
 /// Kill switch that tracks open orders and cancels them when activated.
 /// 
@@ -29,11 +34,24 @@ struct KillSwitchInner {
     /// Optional callback to execute when kill switch is activated
     /// This should trigger cancel commands for all open orders
     cancel_callback: Option<CancelCallback>,
+    /// Channel sender for async cancel operations
+    /// When kill switch is activated, execution IDs are sent here
+    /// to be processed by an async task
+    cancel_channel: Option<CancelChannel>,
 }
 
 impl Default for KillSwitch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl CancelChannel {
+    /// Send an execution ID to be cancelled
+    pub fn send(&self, exec_id: ExecutionId) {
+        if let Err(e) = self.0.try_send(exec_id) {
+            tracing::error!("Failed to send cancel command: {}", e);
+        }
     }
 }
 
@@ -45,8 +63,41 @@ impl KillSwitch {
                 enabled: false,
                 open_orders: HashSet::new(),
                 cancel_callback: None,
+                cancel_channel: None,
             })),
         }
+    }
+
+    /// Create a kill switch with a channel for async cancel operations
+    /// 
+    /// Returns the KillSwitch and a Receiver that will receive ExecutionIds
+    /// to cancel when the kill switch is activated
+    /// 
+    /// # Example
+    /// ```no_run
+    /// use broker_gateway_service::core::application::kill_switch::KillSwitch;
+    /// 
+    /// let (kill_switch, mut cancel_rx) = KillSwitch::with_channel();
+    /// 
+    /// // Spawn a task to process cancel commands
+    /// tokio::spawn(async move {
+    ///     while let Some(exec_id) = cancel_rx.recv().await {
+    ///         // Call your async cancel function here
+    ///         println!("Cancelling order: {:?}", exec_id);
+    ///     }
+    /// });
+    /// ```
+    pub fn with_channel() -> (Self, Receiver<ExecutionId>) {
+        let (tx, rx) = mpsc::channel::<ExecutionId>(100);
+        let kill_switch = Self {
+            inner: Arc::new(Mutex::new(KillSwitchInner {
+                enabled: false,
+                open_orders: HashSet::new(),
+                cancel_callback: None,
+                cancel_channel: Some(CancelChannel(tx)),
+            })),
+        };
+        (kill_switch, rx)
     }
 
     /// Check if the kill switch is enabled
@@ -60,7 +111,7 @@ impl KillSwitch {
     /// - Number of open orders that were marked for cancellation
     /// 
     /// # Important
-    /// This will trigger the cancel callback for each open order if registered
+    /// This will trigger the cancel callback or send to channel for each open order if registered
     pub fn enable(&self) -> usize {
         let mut inner = self.inner.lock().unwrap();
         
@@ -75,14 +126,19 @@ impl KillSwitch {
         if order_count > 0 {
             tracing::error!("🚨 KILL SWITCH ACTIVATED - Cancelling {} open orders", order_count);
             
-            // Cancel all open orders
-            if let Some(ref callback) = inner.cancel_callback {
+            // Cancel all open orders - use channel if available, otherwise use callback
+            if let Some(ref channel) = inner.cancel_channel {
+                for execution_id in &inner.open_orders {
+                    tracing::error!("🚨 Kill switch sending cancel for order: {}", execution_id);
+                    channel.send(ExecutionId(execution_id.clone()));
+                }
+            } else if let Some(ref callback) = inner.cancel_callback {
                 for execution_id in &inner.open_orders {
                     tracing::error!("🚨 Kill switch cancelling order: {}", execution_id);
                     callback(ExecutionId(execution_id.clone()));
                 }
             } else {
-                tracing::warn!("Kill switch has no cancel callback registered - orders tracked but not cancelled");
+                tracing::warn!("Kill switch has no cancel mechanism registered - orders tracked but not cancelled");
             }
         } else {
             tracing::error!("🚨 KILL SWITCH ACTIVATED - No open orders to cancel");
@@ -117,6 +173,10 @@ impl KillSwitch {
     ///     println!("Cancelling order: {:?}", exec_id);
     /// });
     /// ```
+    /// 
+    /// # Note
+    /// For async cancel operations, use `with_channel()` instead and process
+    /// the receiver in an async task.
     pub fn register_cancel_callback<F>(&self, callback: F)
     where
         F: Fn(ExecutionId) + Send + Sync + 'static,
@@ -124,6 +184,35 @@ impl KillSwitch {
         let mut inner = self.inner.lock().unwrap();
         inner.cancel_callback = Some(Arc::new(callback));
         tracing::debug!("Kill switch cancel callback registered");
+    }
+
+    /// Register a cancel channel for async operations
+    /// 
+    /// This allows the kill switch to send execution IDs to an async task
+    /// that can call async cancel methods.
+    /// 
+    /// Returns the Receiver that should be processed by an async task.
+    /// 
+    /// # Example
+    /// ```no_run
+    /// use broker_gateway_service::core::application::kill_switch::KillSwitch;
+    /// 
+    /// let kill_switch = KillSwitch::new();
+    /// let mut rx = kill_switch.register_cancel_channel();
+    /// 
+    /// tokio::spawn(async move {
+    ///     while let Some(exec_id) = rx.recv().await {
+    ///         // Call async cancel here
+    ///         println!("Cancelling order: {:?}", exec_id);
+    ///     }
+    /// });
+    /// ```
+    pub fn register_cancel_channel(&self) -> Receiver<ExecutionId> {
+        let (tx, rx) = mpsc::channel::<ExecutionId>(100);
+        let mut inner = self.inner.lock().unwrap();
+        inner.cancel_channel = Some(CancelChannel(tx));
+        tracing::debug!("Kill switch cancel channel registered");
+        rx
     }
 
     /// Track an open order

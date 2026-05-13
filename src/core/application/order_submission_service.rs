@@ -16,7 +16,7 @@ use crate::adapters::broker::broker_error::BrokerError;
 pub struct OrderSubmissionService {
     validator: RequestValidator,
     idempotency: IdempotencyStore,
-    execution_port: Box<dyn IExecutionPort<Error = BrokerError>>,
+    execution_port: Arc<dyn IExecutionPort<Error = BrokerError> + Send + Sync>,
     kill_switch: Arc<KillSwitch>,
     circuit_breaker: Arc<CircuitBreaker>,
     broker_id: String,
@@ -26,39 +26,62 @@ impl OrderSubmissionService {
     pub fn new(
         validator: RequestValidator,
         idempotency: IdempotencyStore,
-        execution_port: Box<dyn IExecutionPort<Error = BrokerError>>,
+        execution_port: Box<dyn IExecutionPort<Error = BrokerError> + Send + Sync>,
         kill_switch: Arc<KillSwitch>,
         circuit_breaker: Arc<CircuitBreaker>,
         broker_id: impl Into<String>,
     ) -> Self {
-        let service = Self {
+        // Convert Box to Arc so we can share it with the kill switch cancel task
+        let execution_port: Arc<dyn IExecutionPort<Error = BrokerError> + Send + Sync> = 
+            box_to_arc(execution_port);
+        
+        // Register a cancel channel and spawn a task to process kill switch cancels
+        let mut cancel_rx = kill_switch.register_cancel_channel();
+        let exec_port_clone = execution_port.clone();
+        let circuit_breaker_clone = circuit_breaker.clone();
+        
+        // Only spawn the task if we're in a Tokio runtime context
+        // This allows the service to be created in non-async contexts (like some tests)
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tracing::info!("Kill switch cancel processor started");
+                
+                while let Some(exec_id) = cancel_rx.recv().await {
+                    let exec_id_str = exec_id.0.clone();
+                    tracing::error!("🚨 Kill switch processing cancel for order: {}", exec_id_str);
+                    
+                    let cancel_cmd = CancelCmd {
+                        execution_id: exec_id,
+                        correlation_id: Some("kill_switch".to_string()),
+                    };
+                    
+                    // Actually send the cancel to the broker
+                    match exec_port_clone.cancel_order(cancel_cmd).await {
+                        Ok(_) => {
+                            tracing::info!("Kill switch successfully cancelled order: {}", exec_id_str);
+                            circuit_breaker_clone.record_success();
+                        }
+                        Err(e) => {
+                            tracing::error!("Kill switch failed to cancel order {}: {:?}", exec_id_str, e);
+                            circuit_breaker_clone.record_failure(&e);
+                        }
+                    }
+                }
+                
+                tracing::warn!("Kill switch cancel processor shutting down - channel closed");
+            });
+        } else {
+            tracing::warn!("No Tokio runtime available - kill switch cancel task not spawned");
+        }
+        
+        Self {
             validator,
             idempotency,
             execution_port,
-            kill_switch: kill_switch.clone(),
+            kill_switch,
             circuit_breaker,
             broker_id: broker_id.into(),
-        };
-        
-        // Register the kill switch callback to cancel orders
-        service.register_kill_switch_callback();
-        
-        service
-    }
-    
-    fn register_kill_switch_callback(&self) {
-        let _execution_port = &self.execution_port;
-        
-        self.kill_switch.register_cancel_callback(move |exec_id| {
-            tracing::error!("🚨 Kill switch triggering cancel for order: {}", exec_id.0);
-            
-            let cancel_cmd = CancelCmd { 
-                execution_id: exec_id,
-                correlation_id: Some("kill_switch".to_string()),
-            };
-            
-            tracing::error!("🚨 Cancel command created for order: {:?}", cancel_cmd);
-        });
+        }
     }
 
     /// Execution-level guard rail checked before every broker call.
@@ -180,5 +203,215 @@ impl OrderSubmissionService {
     /// Check if a specific order is being tracked as open
     pub fn is_order_open(&self, execution_id: &ExecutionId) -> bool {
         self.kill_switch.is_order_tracked(execution_id)
+    }
+}
+
+/// Helper function to convert Box<dyn Trait> to Arc<dyn Trait>
+fn box_to_arc(
+    b: Box<dyn IExecutionPort<Error = BrokerError> + Send + Sync>,
+) -> Arc<dyn IExecutionPort<Error = BrokerError> + Send + Sync> {
+    Arc::from(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::application::validator::RequestValidator;
+    use crate::core::application::idempotency::IdempotencyStore;
+    use crate::core::domain::order::{OrderSide, OrderType, TimeInForce};
+    use crate::core::ports::observability::IObservability;
+    use crate::core::patterns::circuit_breaker::CircuitBreaker;
+    use std::sync::{Mutex, Arc as StdArc};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use async_trait::async_trait;
+
+    // Mock observability for testing
+    #[derive(Clone)]
+    struct MockObservability;
+    impl IObservability for MockObservability {
+        fn emit(&self, _msg: String) {}
+    }
+
+    // Mock execution port that tracks cancel calls
+    struct MockExecutionPort {
+        cancel_calls: Arc<Mutex<Vec<String>>>,
+        order_counter: AtomicU64,
+    }
+
+    impl MockExecutionPort {
+        fn new() -> Self {
+            Self {
+                cancel_calls: Arc::new(Mutex::new(Vec::new())),
+                order_counter: AtomicU64::new(1),
+            }
+        }
+
+        fn get_cancel_calls(&self) -> Vec<String> {
+            self.cancel_calls.lock().unwrap().clone()
+        }
+
+        fn next_order_id(&self) -> String {
+            format!("test-order-{}", self.order_counter.fetch_add(1, Ordering::SeqCst))
+        }
+    }
+
+    // Wrapper that implements IExecutionPort and delegates to the mock
+    // This allows us to share the mock between the service and test assertions
+    struct MockPortWrapper {
+        inner: Arc<MockExecutionPort>,
+    }
+
+    impl MockPortWrapper {
+        fn new(inner: Arc<MockExecutionPort>) -> Self {
+            Self { inner }
+        }
+    }
+
+    #[async_trait]
+    impl IExecutionPort for MockPortWrapper {
+        type Error = BrokerError;
+
+        async fn submit_order(&self, _cmd: OrderCmd) -> Result<ExecutionId, BrokerError> {
+            Ok(ExecutionId(self.inner.next_order_id()))
+        }
+
+        async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), BrokerError> {
+            self.inner.cancel_calls.lock().unwrap().push(cmd.execution_id.0.clone());
+            Ok(())
+        }
+
+        async fn replace_order(&self, _cmd: ReplaceCmd) -> Result<(), BrokerError> {
+            Ok(())
+        }
+
+        async fn query_status(&self, _query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
+            Ok(OrderStatusResponse::new(
+                "test".to_string(),
+                "FILLED".to_string(),
+                "AAPL".to_string(),
+                OrderSide::Buy,
+                100,
+            ))
+        }
+    }
+
+    fn create_test_order(symbol: &str) -> OrderCmd {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        
+        OrderCmd {
+            symbol: symbol.to_string(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            qty: 100,
+            limit_price: None,
+            stop_price: None,
+            time_in_force: TimeInForce::Day,
+            client_order_id: Some(format!("test-client-id-{}", id)),
+            extended_hours: false,
+            notional: None,
+            correlation_id: None,
+        }
+    }
+
+    fn make_service() -> (OrderSubmissionService, Arc<MockExecutionPort>) {
+        let validator = RequestValidator::default();
+        let idempotency = IdempotencyStore::default();
+        let mock_port: Arc<MockExecutionPort> = Arc::new(MockExecutionPort::new());
+        let kill_switch = Arc::new(KillSwitch::new());
+        let circuit_breaker = Arc::new(CircuitBreaker::new(
+            "test-broker",
+            5,
+            30,
+            Arc::new(MockObservability),
+        ));
+
+        // Create a wrapper that implements IExecutionPort and delegates to mock_port
+        let service = OrderSubmissionService::new(
+            validator,
+            idempotency,
+            Box::new(MockPortWrapper::new(mock_port.clone())),
+            kill_switch,
+            circuit_breaker,
+            "test-broker",
+        );
+
+        (service, mock_port)
+    }
+
+    #[tokio::test]
+    async fn kill_switch_cancels_open_orders() {
+        let (service, mock_port) = make_service();
+
+        // Submit an order to track it
+        let order = create_test_order("AAPL");
+        let exec_id = service.submit_order(order).await.unwrap();
+        
+        // Verify order is tracked
+        assert!(service.is_order_open(&exec_id));
+        assert_eq!(service.open_order_count(), 1);
+
+        // Activate kill switch - this should send cancel commands
+        let cancelled_count = service.kill_switch.enable();
+        assert_eq!(cancelled_count, 1);
+
+        // Wait for the cancel task to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify the cancel was actually called on the mock port
+        let cancel_calls = mock_port.get_cancel_calls();
+        assert_eq!(cancel_calls.len(), 1);
+        assert_eq!(cancel_calls[0], exec_id.0);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_cancels_multiple_orders() {
+        let (service, mock_port) = make_service();
+
+        // Submit multiple orders
+        let order1 = create_test_order("AAPL");
+        let order2 = create_test_order("TSLA");
+        let order3 = create_test_order("GOOGL");
+        
+        let exec_id1 = service.submit_order(order1).await.expect("order1 should succeed");
+        let exec_id2 = service.submit_order(order2).await.expect("order2 should succeed");
+        let exec_id3 = service.submit_order(order3).await.expect("order3 should succeed");
+        
+        assert_eq!(service.open_order_count(), 3, "Expected 3 open orders, got {}", service.open_order_count());
+
+        // Activate kill switch
+        service.kill_switch.enable();
+
+        // Wait for processing (longer for multiple orders)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify all orders were cancelled
+        let cancel_calls = mock_port.get_cancel_calls();
+        assert_eq!(cancel_calls.len(), 3, "Expected 3 cancel calls, got: {:?}", cancel_calls);
+        
+        // Verify all execution IDs were cancelled
+        let cancelled_ids: std::collections::HashSet<_> = cancel_calls.into_iter().collect();
+        assert!(cancelled_ids.contains(&exec_id1.0));
+        assert!(cancelled_ids.contains(&exec_id2.0));
+        assert!(cancelled_ids.contains(&exec_id3.0));
+    }
+
+    #[tokio::test]
+    async fn kill_switch_no_callback_when_no_orders() {
+        let (service, mock_port) = make_service();
+
+        // No orders submitted
+        assert_eq!(service.open_order_count(), 0);
+
+        // Activate kill switch
+        let cancelled_count = service.kill_switch.enable();
+        assert_eq!(cancelled_count, 0);
+
+        // Wait and verify no cancels were called
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let cancel_calls = mock_port.get_cancel_calls();
+        assert!(cancel_calls.is_empty());
     }
 }
