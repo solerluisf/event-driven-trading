@@ -49,6 +49,7 @@ fn create_order_cmd(symbol: &str) -> OrderCmd {
         client_order_id: Some("test-123".to_string()),
         extended_hours: false,
         notional: None,
+        correlation_id: None,
     }
 }
 
@@ -56,6 +57,7 @@ fn create_test_response(id: &str, execution_id: &str) -> ResponseRecord {
     ResponseRecord {
         id: id.to_string(),
         raw_payload: Some(format!(r#"{{"execution_id": "{}"}}"#, execution_id)),
+        correlation_id: None,
     }
 }
 
@@ -232,6 +234,7 @@ async fn test_replay_adapter_handles_cancel() {
     
     let cancel_cmd = CancelCmd {
         execution_id: ExecutionId("test-order".to_string()),
+        correlation_id: None,
     };
     
     let result = adapter.cancel_order(cancel_cmd).await;
@@ -255,6 +258,7 @@ async fn test_replay_adapter_handles_replace() {
         side: OrderSide::Buy,
         qty: Some(200),
         limit_price: Some(150.0),
+        correlation_id: None,
     };
     
     let result = adapter.replace_order(replace_cmd).await;
@@ -274,6 +278,7 @@ async fn test_replay_adapter_handles_query() {
     
     let query = StatusQuery {
         execution_id: ExecutionId("test-order".to_string()),
+        correlation_id: None,
     };
     
     let result = adapter.query_status(query).await;
@@ -383,6 +388,7 @@ fn test_replay_extracts_id_from_different_fields() {
     let response1 = ResponseRecord {
         id: "test".to_string(),
         raw_payload: Some(r#"{"execution_id": "exec-123"}"#.to_string()),
+        correlation_id: None,
     };
     let id1 = adapter.extract_execution_id(&response1).unwrap();
     assert_eq!(id1.0, "exec-123");
@@ -391,6 +397,7 @@ fn test_replay_extracts_id_from_different_fields() {
     let response2 = ResponseRecord {
         id: "test".to_string(),
         raw_payload: Some(r#"{"id": "order-456"}"#.to_string()),
+        correlation_id: None,
     };
     let id2 = adapter.extract_execution_id(&response2).unwrap();
     assert_eq!(id2.0, "order-456");
@@ -399,6 +406,7 @@ fn test_replay_extracts_id_from_different_fields() {
     let response3 = ResponseRecord {
         id: "record-789".to_string(),
         raw_payload: None,
+        correlation_id: None,
     };
     let id3 = adapter.extract_execution_id(&response3).unwrap();
     assert!(id3.0.contains("record-789"));

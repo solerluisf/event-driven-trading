@@ -21,10 +21,12 @@ fn test_all_execution_commands_are_critical() {
         client_order_id: Some("test-123".to_string()),
         extended_hours: false,
         notional: None,
+        correlation_id: None,
     });
     
     let cancel = GatewayRequest::CancelOrder(CancelCmd {
         execution_id: ExecutionId("exec-456".to_string()),
+        correlation_id: None,
     });
     
     let replace = GatewayRequest::ReplaceOrder(ReplaceCmd {
@@ -33,6 +35,7 @@ fn test_all_execution_commands_are_critical() {
         side: OrderSide::Buy,
         qty: Some(200),
         limit_price: Some(150.0),
+        correlation_id: None,
     });
     
     // All execution commands should be CRITICAL priority
@@ -50,6 +53,7 @@ fn test_all_execution_commands_are_critical() {
 fn test_query_is_normal_priority() {
     let query = GatewayRequest::QueryStatus(StatusQuery {
         execution_id: ExecutionId("exec-123".to_string()),
+        correlation_id: None,
     });
     
     assert_eq!(CommandPriority::for_request(&query), CommandPriority::Normal);
@@ -60,10 +64,12 @@ fn test_query_is_normal_priority() {
 fn test_subscription_is_low_priority() {
     let subscribe = GatewayRequest::Subscribe(MarketSubscription {
         symbol: "AAPL".to_string(),
+        correlation_id: None,
     });
     
     let unsubscribe = GatewayRequest::Unsubscribe(MarketSubscription {
         symbol: "AAPL".to_string(),
+        correlation_id: None,
     });
     
     assert_eq!(CommandPriority::for_request(&subscribe), CommandPriority::Low);
@@ -124,9 +130,11 @@ fn test_critical_path_only_for_execution_commands() {
             client_order_id: None,
             extended_hours: false,
             notional: None,
+            correlation_id: None,
         }),
         GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("test".to_string()),
+            correlation_id: None,
         }),
         GatewayRequest::ReplaceOrder(ReplaceCmd {
             execution_id: ExecutionId("test".to_string()),
@@ -134,6 +142,7 @@ fn test_critical_path_only_for_execution_commands() {
             side: OrderSide::Buy,
             qty: None,
             limit_price: None,
+            correlation_id: None,
         }),
     ];
     
@@ -152,12 +161,15 @@ fn test_non_execution_commands_use_async() {
     let non_execution_commands = vec![
         GatewayRequest::QueryStatus(StatusQuery {
             execution_id: ExecutionId("test".to_string()),
+            correlation_id: None,
         }),
         GatewayRequest::Subscribe(MarketSubscription {
             symbol: "TEST".to_string(),
+            correlation_id: None,
         }),
         GatewayRequest::Unsubscribe(MarketSubscription {
             symbol: "TEST".to_string(),
+            correlation_id: None,
         }),
     ];
     
