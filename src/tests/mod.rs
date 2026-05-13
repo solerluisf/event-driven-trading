@@ -1852,6 +1852,291 @@ mod single_risk_check_tests {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Request Validation Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod validation_tests {
+    use crate::core::application::validator::RequestValidator;
+    use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, OrderSide, OrderType, TimeInForce, ExecutionId};
+
+    fn validator() -> RequestValidator {
+        RequestValidator::new()
+    }
+
+    fn valid_order() -> OrderCmd {
+        OrderCmd {
+            symbol: "AAPL".to_string(),
+            qty: 100,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            stop_price: None,
+            client_order_id: None,
+            extended_hours: false,
+            notional: None,
+            correlation_id: None,
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Order Validation Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn validate_order_accepts_valid_market_order() {
+        let cmd = valid_order();
+        assert!(validator().validate_order(&cmd).is_ok());
+    }
+
+    #[test]
+    fn validate_order_rejects_empty_symbol() {
+        let mut cmd = valid_order();
+        cmd.symbol = "".to_string();
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("symbol cannot be empty"));
+    }
+
+    #[test]
+    fn validate_order_rejects_zero_quantity() {
+        let mut cmd = valid_order();
+        cmd.qty = 0;
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("quantity must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_order_rejects_excessive_quantity() {
+        let mut cmd = valid_order();
+        cmd.qty = 2_000_000;
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn validate_order_rejects_invalid_symbol_characters() {
+        let mut cmd = valid_order();
+        cmd.symbol = "AAPL@#$".to_string();
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn validate_order_accepts_symbol_with_dots() {
+        let mut cmd = valid_order();
+        cmd.symbol = "BRK.B".to_string();
+        assert!(validator().validate_order(&cmd).is_ok());
+    }
+
+    #[test]
+    fn validate_order_accepts_symbol_with_hyphens() {
+        let mut cmd = valid_order();
+        cmd.symbol = "BF-A".to_string();
+        assert!(validator().validate_order(&cmd).is_ok());
+    }
+
+    #[test]
+    fn validate_order_rejects_symbol_too_long() {
+        let mut cmd = valid_order();
+        cmd.symbol = "A".repeat(21);
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn validate_order_rejects_limit_order_without_price() {
+        let mut cmd = valid_order();
+        cmd.order_type = OrderType::Limit;
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("limit price required"));
+    }
+
+    #[test]
+    fn validate_order_rejects_limit_order_with_zero_price() {
+        let mut cmd = valid_order();
+        cmd.order_type = OrderType::Limit;
+        cmd.limit_price = Some(0.0);
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("price must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_order_rejects_limit_order_with_negative_price() {
+        let mut cmd = valid_order();
+        cmd.order_type = OrderType::Limit;
+        cmd.limit_price = Some(-10.0);
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("price must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_order_rejects_stop_order_without_stop_price() {
+        let mut cmd = valid_order();
+        cmd.order_type = OrderType::Stop;
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("stop price required"));
+    }
+
+    #[test]
+    fn validate_order_rejects_stop_limit_without_limit_price() {
+        let mut cmd = valid_order();
+        cmd.order_type = OrderType::StopLimit;
+        cmd.stop_price = Some(100.0);
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("limit price required"));
+    }
+
+    #[test]
+    fn validate_order_rejects_invalid_notional() {
+        let mut cmd = valid_order();
+        cmd.notional = Some(-1000.0);
+        let err = validator().validate_order(&cmd).unwrap_err();
+        assert!(err.to_string().contains("notional must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_order_accepts_valid_limit_order() {
+        let mut cmd = valid_order();
+        cmd.order_type = OrderType::Limit;
+        cmd.limit_price = Some(150.0);
+        assert!(validator().validate_order(&cmd).is_ok());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Cancel Validation Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn validate_cancel_accepts_valid_execution_id() {
+        let cmd = CancelCmd {
+            execution_id: ExecutionId("exec-123".to_string()),
+            correlation_id: None,
+        };
+        assert!(validator().validate_cancel(&cmd).is_ok());
+    }
+
+    #[test]
+    fn validate_cancel_rejects_empty_execution_id() {
+        let cmd = CancelCmd {
+            execution_id: ExecutionId("".to_string()),
+            correlation_id: None,
+        };
+        let err = validator().validate_cancel(&cmd).unwrap_err();
+        assert!(err.to_string().contains("execution_id cannot be empty"));
+    }
+
+    #[test]
+    fn validate_cancel_rejects_execution_id_too_long() {
+        let cmd = CancelCmd {
+            execution_id: ExecutionId("x".repeat(101)),
+            correlation_id: None,
+        };
+        let err = validator().validate_cancel(&cmd).unwrap_err();
+        assert!(err.to_string().contains("execution_id too long"));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Replace Validation Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn valid_replace() -> ReplaceCmd {
+        ReplaceCmd {
+            execution_id: ExecutionId("exec-123".to_string()),
+            symbol: "AAPL".to_string(),
+            side: OrderSide::Buy,
+            qty: Some(50),
+            limit_price: Some(150.0),
+            correlation_id: None,
+        }
+    }
+
+    #[test]
+    fn validate_replace_accepts_valid_command() {
+        assert!(validator().validate_replace(&valid_replace()).is_ok());
+    }
+
+    #[test]
+    fn validate_replace_rejects_empty_execution_id() {
+        let mut cmd = valid_replace();
+        cmd.execution_id = ExecutionId("".to_string());
+        let err = validator().validate_replace(&cmd).unwrap_err();
+        assert!(err.to_string().contains("execution_id cannot be empty"));
+    }
+
+    #[test]
+    fn validate_replace_rejects_empty_symbol() {
+        let mut cmd = valid_replace();
+        cmd.symbol = "".to_string();
+        let err = validator().validate_replace(&cmd).unwrap_err();
+        assert!(err.to_string().contains("symbol cannot be empty"));
+    }
+
+    #[test]
+    fn validate_replace_rejects_zero_quantity() {
+        let mut cmd = valid_replace();
+        cmd.qty = Some(0);
+        let err = validator().validate_replace(&cmd).unwrap_err();
+        assert!(err.to_string().contains("quantity must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_replace_rejects_negative_limit_price() {
+        let mut cmd = valid_replace();
+        cmd.limit_price = Some(-10.0);
+        let err = validator().validate_replace(&cmd).unwrap_err();
+        assert!(err.to_string().contains("price must be greater than 0"));
+    }
+
+    #[test]
+    fn validate_replace_accepts_optional_qty_none() {
+        let mut cmd = valid_replace();
+        cmd.qty = None;
+        assert!(validator().validate_replace(&cmd).is_ok());
+    }
+
+    #[test]
+    fn validate_replace_accepts_optional_price_none() {
+        let mut cmd = valid_replace();
+        cmd.limit_price = None;
+        assert!(validator().validate_replace(&cmd).is_ok());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Query Status Validation Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn validate_query_accepts_valid_execution_id() {
+        let query = StatusQuery {
+            execution_id: ExecutionId("exec-123".to_string()),
+            correlation_id: None,
+        };
+        assert!(validator().validate_query(&query).is_ok());
+    }
+
+    #[test]
+    fn validate_query_rejects_empty_execution_id() {
+        let query = StatusQuery {
+            execution_id: ExecutionId("".to_string()),
+            correlation_id: None,
+        };
+        let err = validator().validate_query(&query).unwrap_err();
+        assert!(err.to_string().contains("execution_id cannot be empty"));
+    }
+
+    #[test]
+    fn validate_query_rejects_execution_id_too_long() {
+        let query = StatusQuery {
+            execution_id: ExecutionId("x".repeat(101)),
+            correlation_id: None,
+        };
+        let err = validator().validate_query(&query).unwrap_err();
+        assert!(err.to_string().contains("execution_id too long"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Correlation ID Tests
 // ═══════════════════════════════════════════════════════════════════════════
 

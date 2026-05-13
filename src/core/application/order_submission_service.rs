@@ -76,6 +76,9 @@ impl OrderSubmissionService {
     }
 
     pub async fn submit_order(&self, cmd: OrderCmd) -> Result<ExecutionId, BrokerError> {
+        // Validate order parameters
+        self.validator.validate_order(&cmd)?;
+
         // Idempotency key: prefer client_order_id, fall back to symbol
         let idem_key = cmd.client_order_id.clone().unwrap_or_else(|| cmd.symbol.clone());
 
@@ -109,6 +112,9 @@ impl OrderSubmissionService {
     }
 
     pub async fn cancel_order(&self, cmd: CancelCmd) -> Result<(), BrokerError> {
+        // Validate cancel parameters
+        self.validator.validate_cancel(&cmd)?;
+
         self.pre_flight()?;
 
         let result = self.execution_port.cancel_order(cmd.clone()).await;
@@ -127,6 +133,9 @@ impl OrderSubmissionService {
     }
 
     pub async fn replace_order(&self, cmd: ReplaceCmd) -> Result<(), BrokerError> {
+        // Validate replace parameters
+        self.validator.validate_replace(&cmd)?;
+
         self.pre_flight()?;
 
         let result = self.execution_port.replace_order(cmd).await;
@@ -138,6 +147,9 @@ impl OrderSubmissionService {
     }
 
     pub async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
+        // Validate query parameters
+        self.validator.validate_query(&query)?;
+
         self.pre_flight()?;
 
         let result = self.execution_port.query_status(query).await;
