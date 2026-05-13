@@ -383,10 +383,125 @@ impl GatewayService {
 
 impl IMarketDataPort for GatewayService {
     fn subscribe(&self, sub: MarketSubscription) {
-        let _ = self.stream_command_tx.try_send(MarketDataCommand::Subscribe(sub));
+        let symbol = sub.symbol.clone();
+        match self.stream_command_tx.try_send(MarketDataCommand::Subscribe(sub)) {
+            Ok(()) => {
+                tracing::debug!("market data subscribe command queued for {}", symbol);
+            }
+            Err(e) => {
+                tracing::error!("failed to queue market data subscribe command for {}: {}", symbol, e);
+            }
+        }
     }
 
     fn unsubscribe(&self, sub: MarketSubscription) {
-        let _ = self.stream_command_tx.try_send(MarketDataCommand::Unsubscribe(sub));
+        let symbol = sub.symbol.clone();
+        match self.stream_command_tx.try_send(MarketDataCommand::Unsubscribe(sub)) {
+            Ok(()) => {
+                tracing::debug!("market data unsubscribe command queued for {}", symbol);
+            }
+            Err(e) => {
+                tracing::error!("failed to queue market data unsubscribe command for {}: {}", symbol, e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn create_test_subscription(symbol: &str) -> MarketSubscription {
+        MarketSubscription {
+            symbol: symbol.to_string(),
+            correlation_id: None,
+        }
+    }
+
+    #[test]
+    fn test_market_data_subscribe_does_not_panic() {
+        // Test that subscribe doesn't panic when channel is available
+        let (tx, _rx) = std::sync::mpsc::channel::<MarketDataCommand>();
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
+        
+        // Create sender that wraps std channel in async sender interface
+        let (async_tx, _async_rx) = mpsc::channel::<MarketDataCommand>(10);
+        let sub = create_test_subscription("AAPL");
+
+        let gateway = GatewayService {
+            order_submission: Arc::new(MockOrderSubmissionService),
+            risk_management: Arc::new(MockRiskManagementService),
+            observability: Arc::new(MockObservabilityService),
+            connection_manager: ConnectionManager::new(1, 100),
+            stream_command_tx: async_tx,
+            order_lifecycle_publisher: OrderLifecyclePublisher::from_sender(lifecycle_tx),
+            workload_config: WorkloadConfig::default(),
+            broker_id: "test".to_string(),
+        };
+
+        // This should not panic - just log if there's an error
+        gateway.subscribe(sub);
+    }
+
+    #[test]
+    fn test_market_data_unsubscribe_does_not_panic() {
+        let (tx, _rx) = std::sync::mpsc::channel::<MarketDataCommand>();
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
+        let (async_tx, _async_rx) = mpsc::channel::<MarketDataCommand>(10);
+        let sub = create_test_subscription("TSLA");
+
+        let gateway = GatewayService {
+            order_submission: Arc::new(MockOrderSubmissionService),
+            risk_management: Arc::new(MockRiskManagementService),
+            observability: Arc::new(MockObservabilityService),
+            connection_manager: ConnectionManager::new(1, 100),
+            stream_command_tx: async_tx,
+            order_lifecycle_publisher: OrderLifecyclePublisher::from_sender(lifecycle_tx),
+            workload_config: WorkloadConfig::default(),
+            broker_id: "test".to_string(),
+        };
+
+        // This should not panic - just log if there's an error
+        gateway.unsubscribe(sub);
+    }
+
+    // Mock implementations for testing
+    struct MockOrderSubmissionService;
+    struct MockRiskManagementService;
+    struct MockObservabilityService;
+
+    #[async_trait::async_trait]
+    impl IOrderSubmissionService for MockOrderSubmissionService {
+        async fn submit_order(&self, _cmd: OrderCmd) -> Result<ExecutionId, BrokerError> {
+            Ok(ExecutionId("mock-id".to_string()))
+        }
+        async fn cancel_order(&self, _cmd: CancelCmd) -> Result<(), BrokerError> {
+            Ok(())
+        }
+        async fn replace_order(&self, _cmd: ReplaceCmd) -> Result<(), BrokerError> {
+            Ok(())
+        }
+        async fn query_status(&self, _query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
+            Err(BrokerError::Unknown("mock".to_string()))
+        }
+    }
+
+    impl IRiskManagementService for MockRiskManagementService {
+        fn check(&self, _broker_id: &str, _tokens: u32) -> Result<(), BrokerError> {
+            Ok(())
+        }
+        fn activate_kill_switch(&self) {}
+        fn deactivate_kill_switch(&self) {}
+    }
+
+    impl IObservabilityService for MockObservabilityService {
+        fn record_outbound(&self, _record: RequestRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
+        fn record_inbound(&self, _record: ResponseRecord) -> crate::core::ports::journal_repo::JournalResult<()> {
+            Ok(())
+        }
+        fn emit_event(&self, _event: String) {}
     }
 }
