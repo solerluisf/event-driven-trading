@@ -509,7 +509,6 @@ mod tests {
             IdempotencyStore::default(),
             Box::new(MockAdapter::default()),
             Arc::new(KillSwitch::default()),
-            Arc::new(RateLimiterManager::new(200.0)),
             Arc::new(CircuitBreaker::new("test", 3, 30, noop_obs())),
             "test",
         )) as Arc<dyn IOrderSubmissionService>;
@@ -532,6 +531,7 @@ mod tests {
             ConnectionManager::new(5, 500),
             stream_tx,
             order_lifecycle_publisher,
+            "test",
         ))
     }
 

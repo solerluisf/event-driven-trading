@@ -536,17 +536,15 @@ mod order_submission_tests {
     use crate::core::application::idempotency::IdempotencyStore;
     use crate::core::application::kill_switch::KillSwitch;
     use crate::core::application::order_submission_service::OrderSubmissionService;
-    use crate::core::application::rate_limiter::RateLimiterManager;
     use crate::core::application::validator::RequestValidator;
     use crate::core::patterns::circuit_breaker::CircuitBreaker;
 
-    fn make_svc(rpm: f64, cb_threshold: u32) -> OrderSubmissionService {
+    fn make_svc(cb_threshold: u32) -> OrderSubmissionService {
         OrderSubmissionService::new(
             RequestValidator,
             IdempotencyStore::default(),
             Box::new(MockAdapter::default()),
             Arc::new(KillSwitch::default()),
-            Arc::new(RateLimiterManager::new(rpm)),
             Arc::new(CircuitBreaker::new("test", cb_threshold, 30, noop_obs())),
             "test",
         )
@@ -560,7 +558,6 @@ mod order_submission_tests {
             IdempotencyStore::default(),
             Box::new(MockAdapter::default()),
             ks,
-            Arc::new(RateLimiterManager::new(200.0)),
             Arc::new(CircuitBreaker::new("test", 3, 30, noop_obs())),
             "test",
         )
@@ -568,24 +565,15 @@ mod order_submission_tests {
 
     #[tokio::test]
     async fn submit_order_succeeds_with_mock() {
-        let svc = make_svc(200.0, 3);
+        let svc = make_svc(3);
         let result = svc.submit_order(make_order("AAPL")).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().0, "mock-execution-id");
     }
 
     #[tokio::test]
-    async fn kill_switch_blocks_submit() {
-        let ks = Arc::new(KillSwitch::default());
-        ks.enable();
-        let svc = make_svc_with_kill_switch(Arc::clone(&ks));
-        let err = svc.submit_order(make_order("AAPL")).await.unwrap_err();
-        assert!(matches!(err, BrokerError::Unknown(_)));
-    }
-
-    #[tokio::test]
     async fn duplicate_order_is_rejected() {
-        let svc = make_svc(200.0, 3);
+        let svc = make_svc(3);
         let cmd = make_order_with_id("AAPL", "client-001");
         // First submission succeeds
         assert!(svc.submit_order(cmd.clone()).await.is_ok());
@@ -596,25 +584,15 @@ mod order_submission_tests {
 
     #[tokio::test]
     async fn different_client_ids_are_independent() {
-        let svc = make_svc(200.0, 3);
+        let svc = make_svc(3);
         assert!(svc.submit_order(make_order_with_id("AAPL", "id-1")).await.is_ok());
         assert!(svc.submit_order(make_order_with_id("AAPL", "id-2")).await.is_ok());
     }
 
     #[tokio::test]
-    async fn rate_limit_blocks_after_capacity() {
-        // 2 req/min capacity — 2 succeed, 3rd is rejected
-        let svc = make_svc(2.0, 10);
-        assert!(svc.submit_order(make_order_with_id("AAPL", "a")).await.is_ok());
-        assert!(svc.submit_order(make_order_with_id("AAPL", "b")).await.is_ok());
-        let err = svc.submit_order(make_order_with_id("AAPL", "c")).await.unwrap_err();
-        assert!(matches!(err, BrokerError::RateLimited));
-    }
-
-    #[tokio::test]
     async fn cancel_order_succeeds_with_mock() {
         use crate::core::domain::order::{CancelCmd, ExecutionId};
-        let svc = make_svc(200.0, 3);
+        let svc = make_svc(3);
         let result = svc
             .cancel_order(CancelCmd {
                 execution_id: ExecutionId("exec-123".into()),
@@ -625,29 +603,9 @@ mod order_submission_tests {
     }
 
     #[tokio::test]
-    async fn cancel_blocked_by_kill_switch() {
-        use crate::core::domain::order::{CancelCmd, ExecutionId};
-        let ks = Arc::new(KillSwitch::default());
-        ks.enable();
-        let svc = make_svc_with_kill_switch(Arc::clone(&ks));
-        let err = svc
-            .cancel_order(CancelCmd {
-                execution_id: ExecutionId("exec-123".into()),
-                correlation_id: Some("corr-cancel-test-002".into()),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(err, BrokerError::Unknown(_)));
-    }
-
-    #[tokio::test]
     async fn circuit_breaker_open_blocks_submit() {
         use crate::core::domain::order::{CancelCmd, ExecutionId};
-        // Use a failing adapter via circuit breaker threshold of 1
-        // We can't make MockAdapter fail, so we open the breaker manually
-        // by using record_failure directly on a shared Arc.
         let ks = Arc::new(KillSwitch::default());
-        let rl = Arc::new(RateLimiterManager::new(200.0));
         let cb = Arc::new(CircuitBreaker::new("test", 1, 30, noop_obs()));
 
         // Force the breaker open
@@ -659,7 +617,6 @@ mod order_submission_tests {
             IdempotencyStore::default(),
             Box::new(MockAdapter::default()),
             ks,
-            rl,
             Arc::clone(&cb),
             "test",
         );
@@ -868,7 +825,6 @@ mod subscription_tests {
             IdempotencyStore::default(),
             Box::new(MockAdapter::default()),
             Arc::new(KillSwitch::default()),
-            Arc::new(RateLimiterManager::new(200.0)),
             Arc::new(CircuitBreaker::new("test", 3, 30, noop_obs())),
             "test",
         )) as Arc<dyn IOrderSubmissionService>;
@@ -891,6 +847,7 @@ mod subscription_tests {
             ConnectionManager::new(5, 500),
             stream_tx,
             order_lifecycle_publisher,
+            "test",
         );
 
         (gateway, stream_rx)
@@ -1532,6 +1489,365 @@ mod mock_adapter_query_status_tests {
         assert_eq!(response.symbol, "MOCK");
         assert_eq!(response.side, OrderSide::Buy);
         assert_eq!(response.qty, 100);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Single Responsibility: Risk Check Only in GatewayService
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// These tests verify that kill switch and rate limiter are enforced
+// exactly once — at the GatewayService level via RiskManagementService —
+// and NOT again inside OrderSubmissionService.
+
+#[cfg(test)]
+mod single_risk_check_tests {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use super::*;
+    use crate::adapters::broker::mock_adapter::MockAdapter;
+    use crate::adapters::messaging::order_lifecycle_publisher::OrderLifecyclePublisher;
+    use crate::core::application::connection_manager::ConnectionManager;
+    use crate::core::application::gateway_service::GatewayService;
+    use crate::core::application::idempotency::IdempotencyStore;
+    use crate::core::application::kill_switch::KillSwitch;
+    use crate::core::application::observability_service::ObservabilityService;
+    use crate::core::application::order_submission_service::OrderSubmissionService;
+    use crate::core::application::rate_limiter::RateLimiterManager;
+    use crate::core::application::risk_management_service::RiskManagementService;
+    use crate::core::application::validator::RequestValidator;
+    use crate::core::domain::market_data::MarketDataCommand;
+    use crate::core::domain::order::{CancelCmd, ExecutionId, OrderSide, OrderType, OrderCmd, TimeInForce, StatusQuery, ReplaceCmd};
+    use crate::core::domain::journal::{RequestRecord, ResponseRecord};
+    use crate::core::patterns::circuit_breaker::CircuitBreaker;
+    use crate::core::ports::journal_repo::IJournalRepo;
+    use crate::core::ports::service_traits::{IOrderSubmissionService, IRiskManagementService, IObservabilityService};
+
+    struct MockJournalRepo;
+    impl IJournalRepo for MockJournalRepo {
+        fn persist_outbound(&self, _record: RequestRecord) -> crate::core::ports::journal_repo::JournalResult<()> { Ok(()) }
+        fn persist_inbound(&self, _record: ResponseRecord) -> crate::core::ports::journal_repo::JournalResult<()> { Ok(()) }
+        fn replay(&self, _query: String) -> Vec<ResponseRecord> { Vec::new() }
+    }
+
+    fn make_gateway_with_rate_limit(rpm: f64) -> (GatewayService, Arc<KillSwitch>, Arc<RateLimiterManager>) {
+        let (stream_tx, _stream_rx) = mpsc::channel(32);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
+        let order_lifecycle_publisher = OrderLifecyclePublisher::from_sender(lifecycle_tx);
+
+        let kill_switch = Arc::new(KillSwitch::default());
+        let rate_limiter = Arc::new(RateLimiterManager::new(rpm));
+
+        let order_submission = Arc::new(OrderSubmissionService::new(
+            RequestValidator,
+            IdempotencyStore::default(),
+            Box::new(MockAdapter::default()),
+            Arc::clone(&kill_switch),
+            Arc::new(CircuitBreaker::new("test", 100, 30, noop_obs())),
+            "test",
+        )) as Arc<dyn IOrderSubmissionService>;
+
+        let risk_management = Arc::new(RiskManagementService::new(
+            (*kill_switch).clone(),
+            Arc::clone(&rate_limiter),
+        )) as Arc<dyn IRiskManagementService>;
+
+        let observability = Arc::new(ObservabilityService::new(
+            crate::core::patterns::telemetry_decorator::TelemetryDecorator::new(),
+            noop_obs(),
+            Arc::new(MockJournalRepo),
+        )) as Arc<dyn IObservabilityService>;
+
+        let gateway = GatewayService::new(
+            order_submission,
+            risk_management,
+            observability,
+            ConnectionManager::new(5, 500),
+            stream_tx,
+            order_lifecycle_publisher,
+            "test",
+        );
+
+        (gateway, kill_switch, rate_limiter)
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_consumed_once_per_submit_not_twice() {
+        // With 2 tokens and single-check enforcement, exactly 2 submit_order calls
+        // should succeed (1 token each) and the 3rd should be rate-limited.
+        // If double-checked, the 1st call would consume 2 tokens and the 2nd would fail.
+        let (gateway, _ks, _rl) = make_gateway_with_rate_limit(2.0);
+
+        let cmd = OrderCmd {
+            symbol: "AAPL".to_string(),
+            qty: 1,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            stop_price: None,
+            client_order_id: Some("single-risk-1".to_string()),
+            extended_hours: false,
+            notional: None,
+            correlation_id: None,
+        };
+
+        assert!(gateway.submit_order(cmd.clone()).await.is_ok(), "1st order should succeed");
+        let cmd2 = OrderCmd { client_order_id: Some("single-risk-2".to_string()), ..cmd.clone() };
+        assert!(gateway.submit_order(cmd2).await.is_ok(), "2nd order should succeed");
+
+        let cmd3 = OrderCmd { client_order_id: Some("single-risk-3".to_string()), ..cmd.clone() };
+        let err = gateway.submit_order(cmd3).await.unwrap_err();
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::RateLimited),
+            "3rd order should be rate-limited (single check consumed exactly 1 token per call)"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_at_gateway_not_submission() {
+        let (gateway, ks, _rl) = make_gateway_with_rate_limit(200.0);
+
+        ks.enable();
+
+        let cmd = OrderCmd {
+            symbol: "AAPL".to_string(),
+            qty: 1,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            stop_price: None,
+            client_order_id: Some("ks-gateway-1".to_string()),
+            extended_hours: false,
+            notional: None,
+            correlation_id: None,
+        };
+
+        let err = gateway.submit_order(cmd).await.unwrap_err();
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::Unknown(ref m) if m.contains("kill switch")),
+            "should be blocked by kill switch at gateway level"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_cancel_at_gateway() {
+        let (gateway, ks, _rl) = make_gateway_with_rate_limit(200.0);
+
+        ks.enable();
+
+        let err = gateway.cancel_order(CancelCmd {
+            execution_id: ExecutionId("exec-ks-cancel".to_string()),
+            correlation_id: None,
+        }).await.unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::Unknown(ref m) if m.contains("kill switch")),
+            "cancel should be blocked by kill switch at gateway level"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_blocks_replace_at_gateway() {
+        let (gateway, ks, _rl) = make_gateway_with_rate_limit(200.0);
+
+        ks.enable();
+
+        let err = gateway.replace_order(ReplaceCmd {
+            execution_id: ExecutionId("exec-ks-replace".to_string()),
+            symbol: "AAPL".to_string(),
+            side: OrderSide::Buy,
+            qty: None,
+            limit_price: None,
+            correlation_id: None,
+        }).await.unwrap_err();
+
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::Unknown(ref m) if m.contains("kill switch")),
+            "replace should be blocked by kill switch at gateway level"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_consumed_once_for_cancel() {
+        // With 1 token, only 1 cancel should succeed. Second is rate-limited.
+        // Both cancels use the same execution_id so they hit the same rate limit bucket.
+        let (gateway, _ks, _rl) = make_gateway_with_rate_limit(1.0);
+
+        let cmd = CancelCmd {
+            execution_id: ExecutionId("exec-cancel-rate".to_string()),
+            correlation_id: None,
+        };
+
+        assert!(gateway.cancel_order(cmd).await.is_ok(), "1st cancel should succeed");
+
+        // Second cancel with same execution_id shares the same rate limit bucket
+        let cmd2 = CancelCmd {
+            execution_id: ExecutionId("exec-cancel-rate".to_string()),
+            correlation_id: None,
+        };
+
+        let err = gateway.cancel_order(cmd2).await.unwrap_err();
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::RateLimited),
+            "2nd cancel should be rate-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_consumed_once_for_query_status() {
+        // With 1 token, only 1 query should succeed. Second is rate-limited.
+        // Both queries use the same execution_id so they hit the same rate limit bucket.
+        let (gateway, _ks, _rl) = make_gateway_with_rate_limit(1.0);
+
+        let query = StatusQuery {
+            execution_id: ExecutionId("exec-query-rate".to_string()),
+            correlation_id: None,
+        };
+
+        assert!(gateway.query_status(query).await.is_ok(), "1st query should succeed");
+
+        let query2 = StatusQuery {
+            execution_id: ExecutionId("exec-query-rate".to_string()),
+            correlation_id: None,
+        };
+
+        let err = gateway.query_status(query2).await.unwrap_err();
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::RateLimited),
+            "2nd query should be rate-limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn order_submission_allows_request_when_circuit_breaker_closed_and_gateway_passes() {
+        // Verify that OrderSubmissionService does NOT re-check kill switch or rate limit.
+        // Even if rate limiter has 0 tokens, OrderSubmissionService should pass
+        // because those checks are now exclusively in GatewayService.
+        let ks = Arc::new(KillSwitch::default());
+        let rl = Arc::new(RateLimiterManager::new(1.0));
+        rl.allow("test", 1); // drain all tokens
+
+        let svc = OrderSubmissionService::new(
+            RequestValidator,
+            IdempotencyStore::default(),
+            Box::new(MockAdapter::default()),
+            Arc::clone(&ks),
+            Arc::new(CircuitBreaker::new("test", 100, 30, noop_obs())),
+            "test",
+        );
+
+        let cmd = make_order_with_id("AAPL", "no-double-check-1");
+        // This succeeds because OrderSubmissionService no longer checks rate limit
+        let result = svc.submit_order(cmd).await;
+        assert!(result.is_ok(), "OrderSubmissionService should not re-check rate limit");
+    }
+
+    #[tokio::test]
+    async fn order_submission_does_not_re_check_kill_switch() {
+        let ks = Arc::new(KillSwitch::default());
+        ks.enable(); // kill switch active
+
+        let svc = OrderSubmissionService::new(
+            RequestValidator,
+            IdempotencyStore::default(),
+            Box::new(MockAdapter::default()),
+            Arc::clone(&ks),
+            Arc::new(CircuitBreaker::new("test", 100, 30, noop_obs())),
+            "test",
+        );
+
+        let cmd = make_order_with_id("AAPL", "no-double-ks-1");
+        // This succeeds because OrderSubmissionService no longer checks kill switch
+        let result = svc.submit_order(cmd).await;
+        assert!(result.is_ok(), "OrderSubmissionService should not re-check kill switch");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_shared_across_submit_cancel_replace_query() {
+        // All operations (submit, cancel, replace, query) share the same broker_id
+        // rate limit bucket. With 3 tokens, 3 operations of any type should succeed
+        // and the 4th should be rate-limited — regardless of symbol or execution_id.
+        let (gateway, _ks, _rl) = make_gateway_with_rate_limit(3.0);
+
+        // submit_order uses broker_id="test"
+        let order = OrderCmd {
+            symbol: "AAPL".to_string(),
+            qty: 1,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            stop_price: None,
+            client_order_id: Some("broker-id-1".to_string()),
+            extended_hours: false,
+            notional: None,
+            correlation_id: None,
+        };
+        assert!(gateway.submit_order(order).await.is_ok(), "1st op (submit) should succeed");
+
+        // cancel_order also uses broker_id="test" — shares same bucket
+        let cancel = CancelCmd {
+            execution_id: ExecutionId("exec-different-id".to_string()),
+            correlation_id: None,
+        };
+        assert!(gateway.cancel_order(cancel).await.is_ok(), "2nd op (cancel) should succeed");
+
+        // replace_order also uses broker_id="test"
+        let replace = ReplaceCmd {
+            execution_id: ExecutionId("exec-yet-another".to_string()),
+            symbol: "MSFT".to_string(),
+            side: OrderSide::Sell,
+            qty: Some(50),
+            limit_price: Some(300.0),
+            correlation_id: None,
+        };
+        assert!(gateway.replace_order(replace).await.is_ok(), "3rd op (replace) should succeed");
+
+        // 4th operation should be rate-limited — bucket is empty
+        let query = StatusQuery {
+            execution_id: ExecutionId("exec-query".to_string()),
+            correlation_id: None,
+        };
+        let err = gateway.query_status(query).await.unwrap_err();
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::RateLimited),
+            "4th op should be rate-limited — all operations share one bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_symbols_share_rate_limit() {
+        // Verifies that two orders for different symbols (AAPL, MSFT) share
+        // the same rate limit bucket because they use the same broker_id,
+        // NOT per-symbol buckets.
+        let (gateway, _ks, _rl) = make_gateway_with_rate_limit(1.0);
+
+        let order1 = OrderCmd {
+            symbol: "AAPL".to_string(),
+            qty: 1,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            stop_price: None,
+            client_order_id: Some("broker-id-aapl".to_string()),
+            extended_hours: false,
+            notional: None,
+            correlation_id: None,
+        };
+        assert!(gateway.submit_order(order1).await.is_ok(), "1st order (AAPL) should succeed");
+
+        let order2 = OrderCmd {
+            symbol: "MSFT".to_string(),
+            ..make_order("MSFT")
+        };
+        let err = gateway.submit_order(order2).await.unwrap_err();
+        assert!(
+            matches!(err, crate::adapters::broker::broker_error::BrokerError::RateLimited),
+            "2nd order (MSFT) should be rate-limited — both share broker_id bucket"
+        );
     }
 }
 

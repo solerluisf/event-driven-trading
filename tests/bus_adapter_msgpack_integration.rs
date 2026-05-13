@@ -66,7 +66,7 @@ fn make_gateway_service() -> (GatewayService, Arc<RateLimiterManager>) {
     let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
     let order_lifecycle_publisher = OrderLifecyclePublisher::from_sender(lifecycle_tx);
 
-    // Create shared rate limiter for both service and bus adapter
+    // Create shared rate limiter for risk management
     let rate_limiter = Arc::new(RateLimiterManager::new(200.0));
 
     let order_submission = Arc::new(OrderSubmissionService::new(
@@ -74,7 +74,6 @@ fn make_gateway_service() -> (GatewayService, Arc<RateLimiterManager>) {
         IdempotencyStore::default(),
         Box::new(MockAdapter::default()),
         Arc::new(KillSwitch::default()),
-        Arc::clone(&rate_limiter),
         Arc::new(CircuitBreaker::new("test", 3, 30, noop_obs())),
         "test",
     )) as Arc<dyn IOrderSubmissionService>;
@@ -97,6 +96,7 @@ fn make_gateway_service() -> (GatewayService, Arc<RateLimiterManager>) {
         ConnectionManager::new(5, 500),
         stream_tx,
         order_lifecycle_publisher,
+        "test",
     );
 
     (gateway, rate_limiter)

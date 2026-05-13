@@ -124,7 +124,6 @@ async fn main() {
         IdempotencyStore::default(),
         adapter,
         Arc::clone(&kill_switch),
-        Arc::clone(&rate_limiter),
         Arc::clone(&circuit_breaker),
         &cfg.broker,
     )) as Arc<dyn IOrderSubmissionService>;
@@ -166,6 +165,7 @@ async fn main() {
         stream_command_tx.clone(),
         order_lifecycle_publisher,
         cfg.workload_config.clone(),
+        &cfg.broker,
     ));
 
     // ── Event reactor for symbol-specific market data handling ────────────────

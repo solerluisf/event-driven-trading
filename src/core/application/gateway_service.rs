@@ -29,6 +29,10 @@ pub struct GatewayService {
     stream_command_tx: Sender<MarketDataCommand>,
     order_lifecycle_publisher: OrderLifecyclePublisher,
     workload_config: WorkloadConfig,
+    /// The broker identifier used for rate limiting and risk management checks.
+    /// This must be a consistent value like "alpaca" (not a stock symbol or execution ID)
+    /// so that all requests to the same broker share one rate limit bucket.
+    broker_id: String,
 }
 
 impl GatewayService {
@@ -39,6 +43,7 @@ impl GatewayService {
         connection_manager: ConnectionManager,
         stream_command_tx: Sender<MarketDataCommand>,
         order_lifecycle_publisher: OrderLifecyclePublisher,
+        broker_id: impl Into<String>,
     ) -> Self {
         Self {
             order_submission,
@@ -48,6 +53,7 @@ impl GatewayService {
             stream_command_tx,
             order_lifecycle_publisher,
             workload_config: WorkloadConfig::default(),
+            broker_id: broker_id.into(),
         }
     }
 
@@ -60,6 +66,7 @@ impl GatewayService {
         stream_command_tx: Sender<MarketDataCommand>,
         order_lifecycle_publisher: OrderLifecyclePublisher,
         workload_config: WorkloadConfig,
+        broker_id: impl Into<String>,
     ) -> Self {
         Self {
             order_submission,
@@ -69,6 +76,7 @@ impl GatewayService {
             stream_command_tx,
             order_lifecycle_publisher,
             workload_config,
+            broker_id: broker_id.into(),
         }
     }
 
@@ -102,7 +110,7 @@ impl GatewayService {
         self.validate_workload(WorkloadType::LiveTrading)?;
 
         // Risk check (kill switch + rate limit) before anything else
-        self.risk_management.check(&cmd.symbol, 1)?;
+        self.risk_management.check(&self.broker_id, 1)?;
 
         // Journal the outbound intent BEFORE executing.
         // This is critical: if we can't journal the intent, we must not execute.
@@ -150,7 +158,7 @@ impl GatewayService {
         // Validate workload is allowed (cancel is part of LiveTrading workload)
         self.validate_workload(WorkloadType::LiveTrading)?;
 
-        self.risk_management.check(&cmd.execution_id.0, 1)?;
+        self.risk_management.check(&self.broker_id, 1)?;
         
         // Journal the outbound intent BEFORE executing
         if let Err(e) = self.observability.record_outbound(RequestRecord {
@@ -185,7 +193,7 @@ impl GatewayService {
         // Validate workload is allowed (replace is part of LiveTrading workload)
         self.validate_workload(WorkloadType::LiveTrading)?;
 
-        self.risk_management.check(&cmd.execution_id.0, 1)?;
+        self.risk_management.check(&self.broker_id, 1)?;
         
         // Journal the outbound intent BEFORE executing
         if let Err(e) = self.observability.record_outbound(RequestRecord {
@@ -228,6 +236,9 @@ impl GatewayService {
     pub async fn query_status(&self, query: StatusQuery) -> Result<OrderStatusResponse, BrokerError> {
         // Validate workload is allowed
         self.validate_workload(WorkloadType::Query)?;
+
+        // Risk check (rate limit) — single point of enforcement for queries
+        self.risk_management.check(&self.broker_id, 1)?;
 
         // Note: query_status is a read-only operation, but we still track it for observability
         if let Err(e) = self.observability.record_outbound(RequestRecord {

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use crate::core::application::validator::RequestValidator;
 use crate::core::application::idempotency::IdempotencyStore;
 use crate::core::application::kill_switch::KillSwitch;
-use crate::core::application::rate_limiter::RateLimiterManager;
 use crate::core::domain::order::{OrderCmd, CancelCmd, ReplaceCmd, StatusQuery, ExecutionId, OrderStatusResponse};
 use crate::core::ports::execution_port::IExecutionPort;
 use crate::core::patterns::circuit_breaker::CircuitBreaker;
@@ -19,9 +18,7 @@ pub struct OrderSubmissionService {
     idempotency: IdempotencyStore,
     execution_port: Box<dyn IExecutionPort<Error = BrokerError>>,
     kill_switch: Arc<KillSwitch>,
-    rate_limiter: Arc<RateLimiterManager>,
     circuit_breaker: Arc<CircuitBreaker>,
-    /// The broker id this service routes to (used for rate limiting)
     broker_id: String,
 }
 
@@ -31,7 +28,6 @@ impl OrderSubmissionService {
         idempotency: IdempotencyStore,
         execution_port: Box<dyn IExecutionPort<Error = BrokerError>>,
         kill_switch: Arc<KillSwitch>,
-        rate_limiter: Arc<RateLimiterManager>,
         circuit_breaker: Arc<CircuitBreaker>,
         broker_id: impl Into<String>,
     ) -> Self {
@@ -40,7 +36,6 @@ impl OrderSubmissionService {
             idempotency,
             execution_port,
             kill_switch: kill_switch.clone(),
-            rate_limiter,
             circuit_breaker,
             broker_id: broker_id.into(),
         };
@@ -51,10 +46,7 @@ impl OrderSubmissionService {
         service
     }
     
-    /// Register the cancel callback with the kill switch
     fn register_kill_switch_callback(&self) {
-        // Note: This is a simplified implementation. In production, 
-        // you'd want to spawn a task to handle async cancel operations.
         let _execution_port = &self.execution_port;
         
         self.kill_switch.register_cancel_callback(move |exec_id| {
@@ -65,28 +57,16 @@ impl OrderSubmissionService {
                 correlation_id: Some("kill_switch".to_string()),
             };
             
-            // Execute cancel - we can't use .await here since we're in a sync callback
-            // In production, this should spawn a task to cancel the order
-            // For now, we log and rely on the adapter to handle the cancel
             tracing::error!("🚨 Cancel command created for order: {:?}", cancel_cmd);
         });
     }
 
-    /// Guard rail checked before every broker call.
+    /// Execution-level guard rail checked before every broker call.
+    /// Kill switch and rate limiter checks are handled by GatewayService
+    /// via RiskManagementService to avoid double-checking and double token consumption.
     fn pre_flight(&self) -> Result<(), BrokerError> {
-        // 1. Kill switch
-        if self.kill_switch.is_enabled() {
-            tracing::error!("order blocked: kill switch is active");
-            return Err(BrokerError::Unknown("kill switch is active".into()));
-        }
-
-        // 2. Rate limiter
-        if !self.rate_limiter.allow(&self.broker_id, 1) {
-            tracing::warn!("order blocked: rate limit reached for {}", self.broker_id);
-            return Err(BrokerError::RateLimited);
-        }
-
-        // 3. Circuit breaker open check
+        // Circuit breaker open check — this is an execution-layer concern
+        // protecting the broker connection from cascading failures.
         if self.circuit_breaker.is_open() {
             tracing::warn!("order blocked: circuit breaker open for {}", self.broker_id);
             return Err(BrokerError::Unknown("circuit breaker open".into()));
