@@ -56,10 +56,9 @@ impl CircuitBreaker {
 
     /// Wrap a fallible async-compatible closure.
     /// Returns Err immediately if the breaker is Open.
-    pub fn call<F, T, E>(&self, f: F) -> Result<T, E>
+    pub fn call<F, T>(&self, f: F) -> Result<T, String>
     where
-        F: FnOnce() -> Result<T, E>,
-        E: std::fmt::Display,
+        F: FnOnce() -> Result<T, String>,
     {
         {
             let mut g = self.inner.lock().unwrap();
@@ -71,14 +70,8 @@ impl CircuitBreaker {
                             self.broker_id
                         );
                         tracing::warn!("{}", msg);
-                        self.observability.emit(msg);
-                        // Return the closure's error type by calling it and
-                        // discarding — we need an E but can't construct one
-                        // generically.  Instead we transition to HalfOpen and
-                        // let one probe through.
-                        // (See note below.)
-                        drop(g);
-                        // fall through to probe
+                        self.observability.emit(msg.clone());
+                        return Err(msg);
                     } else {
                         // Cooldown expired → probe
                         g.state = State::HalfOpen;

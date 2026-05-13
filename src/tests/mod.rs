@@ -463,6 +463,53 @@ mod circuit_breaker_tests {
         assert!(result.is_ok());
         assert!(!cb.is_open());
     }
+
+    #[test]
+    fn call_rejects_when_open_within_cooldown() {
+        // This test verifies the fix for the bug where call() would
+        // execute f() even when the breaker was Open and within cooldown.
+        let cb = make_cb(1, 60); // 60 second cooldown
+        cb.record_failure(&"e"); // opens the breaker
+        assert!(cb.is_open(), "breaker should be open");
+
+        // The closure should NOT be called when breaker is open
+        let mut closure_called = false;
+        let result = cb.call(|| {
+            closure_called = true;
+            Ok(42)
+        });
+
+        assert!(
+            result.is_err(),
+            "call should return Err when breaker is open"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("rejected"),
+            "error should indicate rejection, got: {:?}",
+            err_msg
+        );
+        assert!(
+            !closure_called,
+            "closure should NOT be called when breaker is open"
+        );
+        assert!(cb.is_open(), "breaker should still be open");
+    }
+
+    #[test]
+    fn call_rejects_emits_observability_event() {
+        let (cb, rec) = make_cb_recording(1, 60);
+        cb.record_failure(&"e"); // opens the breaker
+
+        let _ = cb.call(|| Ok(42));
+
+        let events = rec.emitted();
+        assert!(
+            events.iter().any(|e| e.contains("circuit_breaker.rejected")),
+            "expected rejected event, got: {:?}",
+            events
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
