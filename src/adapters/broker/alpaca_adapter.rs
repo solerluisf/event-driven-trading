@@ -158,9 +158,19 @@ impl IExecutionPort for AlpacaBrokerAdapter {
         // Extract filled quantity - Num has to_u64 which returns Option<u64>
         let filled_qty: u32 = order.filled_quantity.to_u64().unwrap_or(0) as u32;
         
-        // For total quantity, we use a default since Amount type doesn't expose the value directly
-        // In a real implementation, you might need to track this separately or use the API differently
-        let total_qty: u32 = 100; // Placeholder - in production, track from original order submission
+        // Extract total quantity from the order amount
+        // Amount can be either Quantity or Notional, we handle both cases
+        let total_qty: u32 = match &order.amount {
+            Amount::Quantity { quantity } => {
+                quantity.to_u64().unwrap_or(0) as u32
+            }
+            Amount::Notional { notional } => {
+                // For notional orders, we can't determine exact quantity without price
+                // Return 0 as placeholder - in production, you may want to track original order qty separately
+                tracing::warn!("Notional order detected (notional={}), using 0 as total qty", notional);
+                0
+            }
+        };
         
         // Extract remaining quantity
         let remaining_qty: u32 = total_qty.saturating_sub(filled_qty);
@@ -193,5 +203,67 @@ impl IExecutionPort for AlpacaBrokerAdapter {
         );
 
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that quantity extraction from Amount enum works correctly
+    #[test]
+    fn test_quantity_extraction_from_amount() {
+        // Test Quantity variant
+        let qty_amount = Amount::quantity(500u32);
+        let extracted_qty: u32 = match &qty_amount {
+            Amount::Quantity { quantity } => {
+                quantity.to_u64().unwrap_or(0) as u32
+            }
+            Amount::Notional { .. } => 0,
+        };
+        assert_eq!(extracted_qty, 500);
+
+        // Test Notional variant
+        let notional_amount = Amount::notional(Num::from(1000));
+        let extracted_notional: u32 = match &notional_amount {
+            Amount::Quantity { quantity } => {
+                quantity.to_u64().unwrap_or(0) as u32
+            }
+            Amount::Notional { .. } => 0,
+        };
+        assert_eq!(extracted_notional, 0); // Returns 0 for notional orders
+    }
+
+    /// Test that remaining quantity calculation works correctly
+    #[test]
+    fn test_remaining_qty_calculation() {
+        let total_qty: u32 = 1000;
+        let filled_qty: u32 = 350;
+        let remaining_qty: u32 = total_qty.saturating_sub(filled_qty);
+        assert_eq!(remaining_qty, 650);
+
+        // Test edge case where filled > total
+        let total_qty: u32 = 100;
+        let filled_qty: u32 = 150;
+        let remaining_qty: u32 = total_qty.saturating_sub(filled_qty);
+        assert_eq!(remaining_qty, 0); // saturating_sub should return 0, not underflow
+    }
+
+    /// Test quantity extraction with fractional quantities
+    #[test]
+    fn test_fractional_quantity_extraction() {
+        // Alpaca supports fractional shares, so quantity could be like 10.5
+        let fractional_qty = Num::from_str("10.5").unwrap();
+        let amount = Amount::Quantity { quantity: fractional_qty };
+        
+        let extracted: u32 = match &amount {
+            Amount::Quantity { quantity } => {
+                quantity.to_u64().unwrap_or(0) as u32
+            }
+            Amount::Notional { .. } => 0,
+        };
+        
+        // Fractional part should be truncated when converting to u64
+        assert_eq!(extracted, 10);
     }
 }
