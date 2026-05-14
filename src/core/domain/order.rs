@@ -65,6 +65,9 @@ pub struct OrderCmd {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CancelCmd {
     pub execution_id: ExecutionId,
+    /// Symbol of the order being cancelled.
+    /// Required for accurate event publishing and tracking.
+    pub symbol: String,
     /// Optional correlation ID for end-to-end request tracking.
     /// If provided, this will be echoed back in the response.
     pub correlation_id: Option<String>,

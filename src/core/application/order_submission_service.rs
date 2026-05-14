@@ -52,6 +52,7 @@ impl OrderSubmissionService {
                     
                     let cancel_cmd = CancelCmd {
                         execution_id: exec_id,
+                        symbol: "KILL_SWITCH".to_string(), // Kill switch cancellations don't track symbol separately
                         correlation_id: Some("kill_switch".to_string()),
                     };
                     

@@ -617,6 +617,7 @@ mod tests {
     fn test_cancel_order_is_critical_priority() {
         let req = GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("exec-123".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: Some("corr-cancel-001".to_string()),
         });
         assert_eq!(CommandPriority::for_request(&req), CommandPriority::Critical);
@@ -716,6 +717,7 @@ mod tests {
         });
         let cancel = GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("test".to_string()),
+            symbol: "TEST".to_string(),
             correlation_id: Some("corr-test-003".to_string()),
         });
         let replace = GatewayRequest::ReplaceOrder(ReplaceCmd {

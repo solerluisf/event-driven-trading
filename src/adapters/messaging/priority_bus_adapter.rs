@@ -123,6 +123,7 @@ mod tests {
     fn create_cancel_request() -> GatewayRequest {
         GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("exec-123".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: Some("corr-priority-002".into()),
         })
     }

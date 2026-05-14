@@ -74,6 +74,7 @@ mod correlation_tests {
         let correlation_id = "cancel-corr-789".to_string();
         let cmd = CancelCmd {
             execution_id: ExecutionId("exec-123".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: Some(correlation_id.clone()),
         };
 
@@ -87,6 +88,7 @@ mod correlation_tests {
         let exec_id = ExecutionId("exec-789".to_string());
         let cmd = CancelCmd {
             execution_id: exec_id.clone(),
+            symbol: "AAPL".to_string(),
             correlation_id: None, // No correlation ID provided
         };
 

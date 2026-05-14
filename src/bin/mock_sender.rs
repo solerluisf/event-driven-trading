@@ -64,6 +64,7 @@ async fn main() {
 
     let cancel = GatewayRequest::CancelOrder(CancelCmd {
         execution_id: ExecutionId(exec_id),
+        symbol: "AAPL".to_string(),
         correlation_id: Some("corr-cancel-001".into()),
     });
 

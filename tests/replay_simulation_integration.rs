@@ -234,6 +234,7 @@ async fn test_replay_adapter_handles_cancel() {
     
     let cancel_cmd = CancelCmd {
         execution_id: ExecutionId("test-order".to_string()),
+        symbol: "TEST".to_string(),
         correlation_id: None,
     };
     

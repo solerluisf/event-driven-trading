@@ -171,13 +171,14 @@ impl GatewayService {
         }
         
         let exec_id = cmd.execution_id.0.clone();
+        let symbol = cmd.symbol.clone();
         
         match self.order_submission.cancel_order(cmd).await {
             Ok(()) => {
                 // Publish order cancelled event to PUB socket
                 let event = crate::adapters::messaging::order_lifecycle_publisher::create_cancelled_event(
                     &exec_id,
-                    "unknown", // Symbol not available in CancelCmd, using placeholder
+                    &symbol,
                     None,
                 );
                 if let Err(e) = self.order_lifecycle_publisher.publish(event).await {

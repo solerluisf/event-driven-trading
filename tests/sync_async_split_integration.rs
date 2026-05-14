@@ -26,6 +26,7 @@ fn test_all_execution_commands_are_critical() {
     
     let cancel = GatewayRequest::CancelOrder(CancelCmd {
         execution_id: ExecutionId("exec-456".to_string()),
+        symbol: "AAPL".to_string(),
         correlation_id: None,
     });
     
@@ -134,6 +135,7 @@ fn test_critical_path_only_for_execution_commands() {
         }),
         GatewayRequest::CancelOrder(CancelCmd {
             execution_id: ExecutionId("test".to_string()),
+            symbol: "TEST".to_string(),
             correlation_id: None,
         }),
         GatewayRequest::ReplaceOrder(ReplaceCmd {

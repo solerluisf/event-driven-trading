@@ -643,10 +643,28 @@ mod order_submission_tests {
         let result = svc
             .cancel_order(CancelCmd {
                 execution_id: ExecutionId("exec-123".into()),
+                symbol: "AAPL".to_string(),
                 correlation_id: Some("corr-cancel-test-001".into()),
             })
             .await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn cancel_cmd_includes_symbol_field() {
+        // This test verifies that CancelCmd now includes the symbol field
+        // to ensure accurate event publishing (fix for "unknown" symbol issue)
+        use crate::core::domain::order::{CancelCmd, ExecutionId};
+        
+        let cmd = CancelCmd {
+            execution_id: ExecutionId("exec-456".into()),
+            symbol: "TSLA".to_string(),
+            correlation_id: None,
+        };
+        
+        // Verify the symbol field is accessible and contains the expected value
+        assert_eq!(cmd.symbol, "TSLA");
+        assert_eq!(cmd.execution_id.0, "exec-456");
     }
 
     #[tokio::test]
@@ -1686,6 +1704,7 @@ mod single_risk_check_tests {
 
         let err = gateway.cancel_order(CancelCmd {
             execution_id: ExecutionId("exec-ks-cancel".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: None,
         }).await.unwrap_err();
 
@@ -1724,6 +1743,7 @@ mod single_risk_check_tests {
 
         let cmd = CancelCmd {
             execution_id: ExecutionId("exec-cancel-rate".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: None,
         };
 
@@ -1732,6 +1752,7 @@ mod single_risk_check_tests {
         // Second cancel with same execution_id shares the same rate limit bucket
         let cmd2 = CancelCmd {
             execution_id: ExecutionId("exec-cancel-rate".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: None,
         };
 
@@ -1837,6 +1858,7 @@ mod single_risk_check_tests {
         // cancel_order also uses broker_id="test" — shares same bucket
         let cancel = CancelCmd {
             execution_id: ExecutionId("exec-different-id".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: None,
         };
         assert!(gateway.cancel_order(cancel).await.is_ok(), "2nd op (cancel) should succeed");
@@ -2058,6 +2080,7 @@ mod validation_tests {
     fn validate_cancel_accepts_valid_execution_id() {
         let cmd = CancelCmd {
             execution_id: ExecutionId("exec-123".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: None,
         };
         assert!(validator().validate_cancel(&cmd).is_ok());
@@ -2067,6 +2090,7 @@ mod validation_tests {
     fn validate_cancel_rejects_empty_execution_id() {
         let cmd = CancelCmd {
             execution_id: ExecutionId("".to_string()),
+            symbol: "AAPL".to_string(),
             correlation_id: None,
         };
         let err = validator().validate_cancel(&cmd).unwrap_err();
@@ -2077,6 +2101,7 @@ mod validation_tests {
     fn validate_cancel_rejects_execution_id_too_long() {
         let cmd = CancelCmd {
             execution_id: ExecutionId("x".repeat(101)),
+            symbol: "AAPL".to_string(),
             correlation_id: None,
         };
         let err = validator().validate_cancel(&cmd).unwrap_err();
