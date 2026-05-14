@@ -615,7 +615,9 @@ mod order_submission_tests {
         let svc = make_svc(3);
         let result = svc.submit_order(make_order("AAPL")).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().0, "mock-execution-id");
+        // MockAdapter now generates unique IDs like "mock-exec-1", "mock-exec-2", etc.
+        let exec_id = result.unwrap().0;
+        assert!(exec_id.starts_with("mock-exec-"), "Expected ID to start with 'mock-exec-', got: {}", exec_id);
     }
 
     #[tokio::test]
@@ -1539,7 +1541,7 @@ mod mock_adapter_query_status_tests {
 
     #[tokio::test]
     async fn mock_adapter_query_status_returns_response() {
-        let adapter = MockAdapter;
+        let adapter = MockAdapter::default();
         let query = StatusQuery {
             execution_id: ExecutionId("test-exec-id".to_string()),
             correlation_id: Some("corr-query-test-001".into()),
