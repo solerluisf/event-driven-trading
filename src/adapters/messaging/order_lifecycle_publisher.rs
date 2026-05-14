@@ -82,17 +82,71 @@ impl OrderLifecyclePublisher {
     }
 }
 
-/// Actor task that manages the ZMQ socket and processes publish events
+/// Internal message type for the ZMQ send thread.
+enum ZmqSendMessage {
+    /// Send a message with the given topic and payload
+    Send { topic: String, payload: Vec<u8> },
+    /// Shutdown the thread
+    Shutdown,
+}
+
+/// Actor task that manages the ZMQ socket and processes publish events.
+///
+/// Uses a dedicated thread for ZMQ send operations to avoid blocking tokio worker threads.
+/// This is critical because ZMQ socket operations are synchronous and can block under load,
+/// causing cascading latency in the async runtime.
+///
+/// The ZMQ socket is not thread-safe, so it must be owned by a single dedicated thread.
 async fn publisher_actor(
     endpoint: String,
     mut rx: mpsc::Receiver<OrderLifecycleEvent>,
 ) -> Result<()> {
-    let ctx = zmq::Context::new();
-    let socket = ctx.socket(zmq::PUB)?;
-    socket.bind(&endpoint)?;
+    // Create a channel to communicate with the ZMQ send thread
+    let (zmq_tx, zmq_rx) = std::sync::mpsc::channel::<ZmqSendMessage>();
 
-    tracing::info!("OrderLifecyclePublisher actor bound on {}", endpoint);
+    // Spawn a dedicated thread for ZMQ operations
+    let zmq_thread = std::thread::spawn(move || {
+        let ctx = zmq::Context::new();
+        let socket = match ctx.socket(zmq::PUB) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to create ZMQ socket: {}", e);
+                return Err(e);
+            }
+        };
 
+        if let Err(e) = socket.bind(&endpoint) {
+            tracing::error!("Failed to bind ZMQ socket to {}: {}", endpoint, e);
+            return Err(e);
+        }
+
+        tracing::info!("OrderLifecyclePublisher ZMQ thread bound on {}", endpoint);
+
+        loop {
+            match zmq_rx.recv() {
+                Ok(ZmqSendMessage::Send { topic, payload }) => {
+                    // Send topic frame
+                    if let Err(e) = socket.send(&topic, zmq::SNDMORE) {
+                        tracing::error!("ZMQ send failed for topic: {}", e);
+                        continue;
+                    }
+                    // Send payload frame
+                    if let Err(e) = socket.send(&payload, 0) {
+                        tracing::error!("ZMQ send failed for payload: {}", e);
+                        continue;
+                    }
+                }
+                Ok(ZmqSendMessage::Shutdown) | Err(_) => {
+                    tracing::info!("OrderLifecyclePublisher ZMQ thread shutting down");
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    // Process incoming events and forward to ZMQ thread
     while let Some(event) = rx.recv().await {
         let topic = format!("order_lifecycle.{}", event.execution_id);
         let payload = match encode_order_lifecycle_event(&event) {
@@ -108,16 +162,25 @@ async fn publisher_actor(
             }
         };
 
-        // Send topic frame
-        socket.send(&topic, zmq::SNDMORE)?;
-        // Send payload frame
-        socket.send(&payload, 0)?;
+        // Send to ZMQ thread (non-blocking from async perspective)
+        if let Err(_) = zmq_tx.send(ZmqSendMessage::Send { topic, payload }) {
+            tracing::error!("ZMQ send thread channel closed");
+            return Err(PublisherError::SendError(()));
+        }
 
         tracing::debug!(
             "published order_lifecycle event execution_id={} type={:?}",
             event.execution_id,
             event.event_type
         );
+    }
+
+    // Signal ZMQ thread to shutdown
+    let _ = zmq_tx.send(ZmqSendMessage::Shutdown);
+
+    // Wait for ZMQ thread to finish
+    if let Err(e) = zmq_thread.join() {
+        tracing::error!("ZMQ thread panicked: {:?}", e);
     }
 
     tracing::info!("OrderLifecyclePublisher actor shutting down");
