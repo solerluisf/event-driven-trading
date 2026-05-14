@@ -1815,7 +1815,10 @@ mod single_risk_check_tests {
     }
 
     #[tokio::test]
-    async fn order_submission_does_not_re_check_kill_switch() {
+    async fn order_submission_checks_kill_switch_as_defense_in_depth() {
+        // Defense-in-depth: OrderSubmissionService performs a second kill switch check
+        // right before execution to narrow the TOCTOU race window between the gateway
+        // layer check and actual broker submission.
         let ks = Arc::new(KillSwitch::default());
         ks.enable(); // kill switch active
 
@@ -1828,10 +1831,13 @@ mod single_risk_check_tests {
             "test",
         );
 
-        let cmd = make_order_with_id("AAPL", "no-double-ks-1");
-        // This succeeds because OrderSubmissionService no longer checks kill switch
+        let cmd = make_order_with_id("AAPL", "defense-depth-1");
+        // This should fail because OrderSubmissionService performs defense-in-depth check
         let result = svc.submit_order(cmd).await;
-        assert!(result.is_ok(), "OrderSubmissionService should not re-check kill switch");
+        assert!(result.is_err(), "OrderSubmissionService should block order when kill switch is active (defense-in-depth)");
+        let err_str = format!("{:?}", result.unwrap_err());
+        assert!(err_str.contains("kill switch") || err_str.contains("Kill switch"),
+            "Error should mention kill switch: {}", err_str);
     }
 
     #[tokio::test]
