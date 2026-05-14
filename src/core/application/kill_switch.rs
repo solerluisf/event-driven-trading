@@ -106,34 +106,45 @@ impl KillSwitch {
     }
 
     /// Enable the kill switch and cancel all open orders
-    /// 
+    ///
     /// # Returns
     /// - Number of open orders that were marked for cancellation
-    /// 
+    ///
     /// # Important
     /// This will trigger the cancel callback or send to channel for each open order if registered
     pub fn enable(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        
-        if inner.enabled {
-            tracing::warn!("Kill switch already enabled, {} open orders remain", inner.open_orders.len());
-            return inner.open_orders.len();
-        }
-        
-        inner.enabled = true;
-        let order_count = inner.open_orders.len();
-        
+        // Collect all data needed while holding the lock, then release it
+        // before calling callbacks to prevent potential deadlocks.
+        let (order_count, orders_to_cancel, cancel_callback, cancel_channel) = {
+            let mut inner = self.inner.lock().unwrap();
+
+            if inner.enabled {
+                tracing::warn!("Kill switch already enabled, {} open orders remain", inner.open_orders.len());
+                return inner.open_orders.len();
+            }
+
+            inner.enabled = true;
+            let order_count = inner.open_orders.len();
+
+            // Clone the data we need and the callback/channel references
+            let orders_to_cancel: Vec<String> = inner.open_orders.iter().cloned().collect();
+            let cancel_callback = inner.cancel_callback.clone();
+            let cancel_channel = inner.cancel_channel.clone();
+
+            (order_count, orders_to_cancel, cancel_callback, cancel_channel)
+        }; // Lock is released here before any callbacks are invoked
+
         if order_count > 0 {
             tracing::error!("🚨 KILL SWITCH ACTIVATED - Cancelling {} open orders", order_count);
-            
+
             // Cancel all open orders - use channel if available, otherwise use callback
-            if let Some(ref channel) = inner.cancel_channel {
-                for execution_id in &inner.open_orders {
+            if let Some(channel) = cancel_channel {
+                for execution_id in &orders_to_cancel {
                     tracing::error!("🚨 Kill switch sending cancel for order: {}", execution_id);
                     channel.send(ExecutionId(execution_id.clone()));
                 }
-            } else if let Some(ref callback) = inner.cancel_callback {
-                for execution_id in &inner.open_orders {
+            } else if let Some(callback) = cancel_callback {
+                for execution_id in &orders_to_cancel {
                     tracing::error!("🚨 Kill switch cancelling order: {}", execution_id);
                     callback(ExecutionId(execution_id.clone()));
                 }
@@ -143,7 +154,7 @@ impl KillSwitch {
         } else {
             tracing::error!("🚨 KILL SWITCH ACTIVATED - No open orders to cancel");
         }
-        
+
         order_count
     }
 
@@ -267,5 +278,180 @@ impl KillSwitch {
     /// Check if a specific order is being tracked
     pub fn is_order_tracked(&self, execution_id: &ExecutionId) -> bool {
         self.inner.lock().unwrap().open_orders.contains(&execution_id.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn kill_switch_tracks_and_removes_orders() {
+        let kill_switch = KillSwitch::new();
+        let exec_id = ExecutionId("order-123".to_string());
+
+        assert!(!kill_switch.is_order_tracked(&exec_id));
+        assert_eq!(kill_switch.open_order_count(), 0);
+
+        // Track an order
+        assert!(kill_switch.track_open_order(&exec_id));
+        assert!(kill_switch.is_order_tracked(&exec_id));
+        assert_eq!(kill_switch.open_order_count(), 1);
+
+        // Tracking same order again returns false
+        assert!(!kill_switch.track_open_order(&exec_id));
+        assert_eq!(kill_switch.open_order_count(), 1);
+
+        // Remove the order
+        assert!(kill_switch.remove_open_order(&exec_id));
+        assert!(!kill_switch.is_order_tracked(&exec_id));
+        assert_eq!(kill_switch.open_order_count(), 0);
+
+        // Removing again returns false
+        assert!(!kill_switch.remove_open_order(&exec_id));
+    }
+
+    #[test]
+    fn kill_switch_enable_triggers_callback() {
+        let kill_switch = KillSwitch::new();
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let cancelled_clone = cancelled.clone();
+
+        kill_switch.register_cancel_callback(move |_exec_id| {
+            cancelled_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Track some orders
+        kill_switch.track_open_order(&ExecutionId("order-1".to_string()));
+        kill_switch.track_open_order(&ExecutionId("order-2".to_string()));
+        kill_switch.track_open_order(&ExecutionId("order-3".to_string()));
+
+        // Enable kill switch
+        let count = kill_switch.enable();
+        assert_eq!(count, 3);
+        assert!(kill_switch.is_enabled());
+
+        // Callback should have been called 3 times
+        assert_eq!(cancelled.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn kill_switch_enable_does_not_deadlock_when_callback_accesses_kill_switch() {
+        // This test verifies that enable() releases the lock before calling callbacks.
+        // Previously, this would deadlock because the callback tries to acquire the
+        // same lock that enable() was holding.
+        let kill_switch = KillSwitch::new();
+        let kill_switch_clone = kill_switch.clone();
+        let callback_called = Arc::new(AtomicUsize::new(0));
+        let callback_called_clone = callback_called.clone();
+
+        kill_switch.register_cancel_callback(move |exec_id| {
+            // This callback tries to access the kill switch, which would deadlock
+            // if the lock is held during callback invocation
+            let _ = kill_switch_clone.is_order_tracked(&exec_id);
+            let _ = kill_switch_clone.open_order_count();
+            callback_called_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Track some orders
+        kill_switch.track_open_order(&ExecutionId("order-1".to_string()));
+        kill_switch.track_open_order(&ExecutionId("order-2".to_string()));
+
+        // Enable kill switch - this should not deadlock
+        // Use a thread with timeout to detect potential deadlocks
+        let result = std::thread::spawn(move || {
+            kill_switch.enable()
+        })
+        .join();
+
+        assert!(result.is_ok(), "Enable() should not deadlock");
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(callback_called.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn kill_switch_with_channel_sends_cancels() {
+        let (kill_switch, mut cancel_rx) = KillSwitch::with_channel();
+
+        // Track some orders
+        kill_switch.track_open_order(&ExecutionId("order-1".to_string()));
+        kill_switch.track_open_order(&ExecutionId("order-2".to_string()));
+
+        // Enable kill switch
+        let count = kill_switch.enable();
+        assert_eq!(count, 2);
+
+        // Collect all cancellation requests
+        let mut cancelled_orders = vec![];
+        while let Ok(exec_id) = cancel_rx.try_recv() {
+            cancelled_orders.push(exec_id.0);
+        }
+
+        assert_eq!(cancelled_orders.len(), 2);
+        assert!(cancelled_orders.contains(&"order-1".to_string()));
+        assert!(cancelled_orders.contains(&"order-2".to_string()));
+    }
+
+    #[test]
+    fn kill_switch_disable_allows_new_orders() {
+        let kill_switch = KillSwitch::new();
+
+        // Enable then disable
+        kill_switch.enable();
+        assert!(kill_switch.is_enabled());
+
+        kill_switch.disable();
+        assert!(!kill_switch.is_enabled());
+    }
+
+    #[test]
+    fn kill_switch_enable_when_already_enabled_warns() {
+        let kill_switch = KillSwitch::new();
+        kill_switch.track_open_order(&ExecutionId("order-1".to_string()));
+
+        // First enable
+        let count1 = kill_switch.enable();
+        assert_eq!(count1, 1);
+
+        // Second enable should return same count but warn
+        let count2 = kill_switch.enable();
+        assert_eq!(count2, 1);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_channel_integration() {
+        let kill_switch = KillSwitch::new();
+        let mut cancel_rx = kill_switch.register_cancel_channel();
+
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let cancelled_clone = cancelled.clone();
+
+        // Spawn a task to collect cancellations
+        let collector = tokio::spawn(async move {
+            while let Some(exec_id) = cancel_rx.recv().await {
+                cancelled_clone.lock().unwrap().push(exec_id.0);
+            }
+        });
+
+        // Track orders and enable
+        kill_switch.track_open_order(&ExecutionId("async-order-1".to_string()));
+        kill_switch.track_open_order(&ExecutionId("async-order-2".to_string()));
+
+        kill_switch.enable();
+
+        // Give some time for cancellations to be processed
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Check results
+        let orders = cancelled.lock().unwrap();
+        assert_eq!(orders.len(), 2);
+        assert!(orders.contains(&"async-order-1".to_string()));
+        assert!(orders.contains(&"async-order-2".to_string()));
+
+        // Drop kill switch to close channel
+        drop(kill_switch);
+        let _ = collector.await;
     }
 }
