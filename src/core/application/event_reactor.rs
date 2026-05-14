@@ -111,18 +111,23 @@ impl EventReactor {
 
                         if let Some(worker_list) = workers.get(&symbol) {
                             for worker in worker_list {
-                                match worker.tx.try_send(envelope.clone()) {
-                                    Ok(_) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                // Use send() instead of try_send() to wait for channel space.
+                                // This prevents silent event drops which can cause stale positions.
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_millis(100),
+                                    worker.tx.send(envelope.clone())
+                                ).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => {
+                                        error!("EventReactor: channel closed for {}", symbol);
+                                    }
+                                    Err(_) => {
                                         warn!(
-                                            "EventReactor: channel full for {}, dropping event (handler: {})",
+                                            "EventReactor: channel full for {}, send timed out (handler: {})",
                                             symbol,
                                             worker.handler.name(),
                                         );
                                         obs.emit_event(format!("reactor.drop.{}", symbol));
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        error!("EventReactor: channel closed for {}", symbol);
                                     }
                                 }
                             }
@@ -388,6 +393,86 @@ mod tests {
 
         // Verify that all sources were correctly propagated
         assert_eq!(received_sources, sources, "All sources should be correctly propagated");
+
+        reactor.shutdown().await;
+    }
+
+    /// Test that events are not silently dropped when channel is full.
+    /// Uses a slow handler to create backpressure and verifies all events are delivered.
+    #[tokio::test]
+    async fn event_reactor_does_not_drop_events_under_backpressure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SlowHandler {
+            count: AtomicUsize,
+            expected_count: usize,
+            done_tx: Mutex<Option<oneshot::Sender<usize>>>,
+        }
+
+        #[async_trait]
+        impl EventHandler for SlowHandler {
+            async fn on_event(&self, _event: &ReactorEvent) {
+                // Simulate slow processing to create backpressure
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let count = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+                if count >= self.expected_count {
+                    if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                        let _ = tx.send(count);
+                    }
+                }
+            }
+
+            fn name(&self) -> &str {
+                "slow-handler"
+            }
+        }
+
+        let (event_tx, event_rx) = mpsc::channel::<MarketDataEvent>(16);
+        let observability = Arc::new(TestObservability);
+        let kill_switch = Arc::new(KillSwitch::default());
+        let reactor = EventReactor::spawn(event_rx, observability, kill_switch.clone());
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let event_count = 20; // Send more events than channel capacity (256)
+        let handler = Arc::new(SlowHandler {
+            count: AtomicUsize::new(0),
+            expected_count: event_count,
+            done_tx: Mutex::new(Some(done_tx)),
+        });
+
+        reactor.subscribe("AAPL", handler.clone()).await;
+
+        // Send many events rapidly to create backpressure
+        for i in 0..event_count {
+            let event = MarketDataEvent {
+                symbol: "AAPL".to_string(),
+                event_type: crate::adapters::messaging::market_data_publisher::MarketDataEventType::Trade,
+                timestamp: "2026-05-07T00:00:00Z".to_string(),
+                source: "test".to_string(),
+                payload: serde_json::json!({"seq": i}),
+            };
+            event_tx.send(event).await.unwrap();
+        }
+
+        // Wait for all events to be processed with generous timeout
+        let received_count = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .expect("handler did not receive all events - events may have been dropped")
+            .expect("handler send failed");
+
+        assert_eq!(
+            received_count, event_count,
+            "All {} events should be received, but only {} were processed. Events were silently dropped!",
+            event_count, received_count
+        );
+
+        // Verify final count
+        let final_count = handler.count.load(Ordering::SeqCst);
+        assert_eq!(
+            final_count, event_count,
+            "Final count should be {}, but was {}",
+            event_count, final_count
+        );
 
         reactor.shutdown().await;
     }
