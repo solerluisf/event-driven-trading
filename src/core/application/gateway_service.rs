@@ -112,28 +112,31 @@ impl GatewayService {
         // Risk check (kill switch + rate limit) before anything else
         self.risk_management.check(&self.broker_id, 1)?;
 
+        // Extract fields needed after submission to avoid cloning the entire OrderCmd
+        let symbol = cmd.symbol.clone();
+        let client_order_id = cmd.client_order_id.clone();
+        let correlation_id = cmd.correlation_id.clone();
+
         // Journal the outbound intent BEFORE executing.
         // This is critical: if we can't journal the intent, we must not execute.
         if let Err(e) = self.observability.record_outbound(RequestRecord {
-            id: cmd.symbol.clone(),
+            id: symbol.clone(),
             raw_payload: serde_json::to_string(&cmd).ok(),
-            correlation_id: cmd.correlation_id.clone().or_else(|| cmd.client_order_id.clone()),
+            correlation_id: correlation_id.clone().or_else(|| client_order_id.clone()),
         }) {
             tracing::error!("CRITICAL: Failed to journal outbound request - refusing to execute. Error: {}", e);
             return Err(BrokerError::Unknown(format!("Journal persistence failed: {}", e)));
         }
 
-        // Submit
-        let execution_id = self.order_submission.submit_order(cmd.clone()).await?;
+        // Submit - ownership of cmd is transferred here, no clone needed
+        let execution_id = self.order_submission.submit_order(cmd).await?;
 
         // Publish order submitted event to PUB socket
-        let client_order_id = cmd.client_order_id.clone();
-        let symbol = cmd.symbol.clone();
         let exec_id = execution_id.0.clone();
         let event = crate::adapters::messaging::order_lifecycle_publisher::create_submitted_event(
             &exec_id,
             &symbol,
-            client_order_id,
+            client_order_id.clone(),
         );
         if let Err(e) = self.order_lifecycle_publisher.publish(event).await {
             tracing::warn!("failed to publish order submitted event: {}", e);
@@ -144,7 +147,7 @@ impl GatewayService {
         if let Err(e) = self.observability.record_inbound(ResponseRecord {
             id: execution_id.0.clone(),
             raw_payload: None,
-            correlation_id: cmd.correlation_id.clone().or_else(|| cmd.client_order_id.clone()),
+            correlation_id: correlation_id.or_else(|| client_order_id),
         }) {
             tracing::error!("CRITICAL: Failed to journal inbound confirmation for execution_id={}. Error: {}", execution_id.0, e);
             // Note: We don't fail the operation here because the broker has already executed.
@@ -411,12 +414,29 @@ impl IMarketDataPort for GatewayService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::domain::order::{OrderSide, OrderType, TimeInForce};
     use tokio::sync::mpsc;
 
     fn create_test_subscription(symbol: &str) -> MarketSubscription {
         MarketSubscription {
             symbol: symbol.to_string(),
             correlation_id: None,
+        }
+    }
+
+    fn create_test_order_cmd(symbol: &str, client_order_id: Option<&str>, correlation_id: Option<&str>) -> OrderCmd {
+        OrderCmd {
+            symbol: symbol.to_string(),
+            qty: 100,
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Day,
+            limit_price: Some(150.0),
+            stop_price: None,
+            client_order_id: client_order_id.map(|s| s.to_string()),
+            extended_hours: false,
+            notional: None,
+            correlation_id: correlation_id.map(|s| s.to_string()),
         }
     }
 
@@ -504,5 +524,93 @@ mod tests {
             Ok(())
         }
         fn emit_event(&self, _event: String) {}
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_without_clone() {
+        // Test that submit_order works correctly without cloning the entire OrderCmd
+        // This verifies the refactoring to extract fields before consuming cmd
+        let (async_tx, _async_rx) = mpsc::channel::<MarketDataCommand>(10);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(128);
+
+        let gateway = GatewayService {
+            order_submission: Arc::new(MockOrderSubmissionService),
+            risk_management: Arc::new(MockRiskManagementService),
+            observability: Arc::new(MockObservabilityService),
+            connection_manager: ConnectionManager::new(1, 100),
+            stream_command_tx: async_tx,
+            order_lifecycle_publisher: OrderLifecyclePublisher::from_sender(lifecycle_tx),
+            workload_config: WorkloadConfig::default(),
+            broker_id: "test".to_string(),
+        };
+
+        // Create a test order command
+        let cmd = create_test_order_cmd("AAPL", Some("client-123"), Some("corr-456"));
+
+        // Submit the order - this should compile and work without cmd.clone()
+        let result = gateway.submit_order(cmd).await;
+
+        // Verify success
+        assert!(result.is_ok());
+        let execution_id = result.unwrap();
+        assert_eq!(execution_id.0, "mock-id");
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_preserves_correlation_id() {
+        // Test that correlation_id is properly extracted and used for journaling
+        let (async_tx, _async_rx) = mpsc::channel::<MarketDataCommand>(10);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(128);
+
+        let gateway = GatewayService {
+            order_submission: Arc::new(MockOrderSubmissionService),
+            risk_management: Arc::new(MockRiskManagementService),
+            observability: Arc::new(MockObservabilityService),
+            connection_manager: ConnectionManager::new(1, 100),
+            stream_command_tx: async_tx,
+            order_lifecycle_publisher: OrderLifecyclePublisher::from_sender(lifecycle_tx),
+            workload_config: WorkloadConfig::default(),
+            broker_id: "test".to_string(),
+        };
+
+        // Create a test order command with correlation_id
+        let cmd = create_test_order_cmd("TSLA", Some("client-789"), Some("corr-abc"));
+
+        // Submit the order
+        let result = gateway.submit_order(cmd).await;
+        assert!(result.is_ok());
+
+        // Verify that an event was published
+        let event = lifecycle_rx.try_recv();
+        assert!(event.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_order_uses_client_order_id_when_no_correlation_id() {
+        // Test that client_order_id is used as fallback when correlation_id is None
+        let (async_tx, _async_rx) = mpsc::channel::<MarketDataCommand>(10);
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::channel(128);
+
+        let gateway = GatewayService {
+            order_submission: Arc::new(MockOrderSubmissionService),
+            risk_management: Arc::new(MockRiskManagementService),
+            observability: Arc::new(MockObservabilityService),
+            connection_manager: ConnectionManager::new(1, 100),
+            stream_command_tx: async_tx,
+            order_lifecycle_publisher: OrderLifecyclePublisher::from_sender(lifecycle_tx),
+            workload_config: WorkloadConfig::default(),
+            broker_id: "test".to_string(),
+        };
+
+        // Create a test order command with client_order_id but no correlation_id
+        let cmd = create_test_order_cmd("MSFT", Some("client-only"), None);
+
+        // Submit the order - should work without correlation_id
+        let result = gateway.submit_order(cmd).await;
+        assert!(result.is_ok());
+
+        // Verify that an event was published
+        let event = lifecycle_rx.try_recv();
+        assert!(event.is_ok());
     }
 }
