@@ -207,6 +207,147 @@ impl StreamMonitorConfig {
 /// Callback for control events
 pub type ControlEventCallback = Box<dyn Fn(StreamControlEvent) + Send + Sync>;
 
+/// Small-stack-optimized buffer for control events.
+/// Stores up to N events on the stack; spills to heap only if needed.
+/// This avoids allocations for the common case of 0-4 events per call.
+pub struct SmallEventBuffer<const N: usize> {
+    stack: [Option<StreamControlEvent>; N],
+    len: usize,
+    spill: Option<Vec<StreamControlEvent>>,
+}
+
+impl<const N: usize> SmallEventBuffer<N> {
+    /// Create a new empty buffer
+    pub fn new() -> Self {
+        Self {
+            // Initialize with None values - required for fixed-size arrays of Options
+            stack: std::array::from_fn(|_| None),
+            len: 0,
+            spill: None,
+        }
+    }
+
+    /// Push an event into the buffer
+    #[inline]
+    pub fn push(&mut self, event: StreamControlEvent) {
+        if self.len < N {
+            // Store on stack
+            self.stack[self.len] = Some(event);
+            self.len += 1;
+        } else {
+            // Spill to heap
+            self.spill.get_or_insert_with(Vec::new).push(event);
+        }
+    }
+
+    /// Returns true if the buffer contains no events
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0 && self.spill.as_ref().map_or(true, |v| v.is_empty())
+    }
+
+    /// Returns the number of events in the buffer
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len + self.spill.as_ref().map_or(0, |v| v.len())
+    }
+
+    /// Iterate over all events in the buffer
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &StreamControlEvent> {
+        self.stack[..self.len]
+            .iter()
+            .filter_map(|opt| opt.as_ref())
+            .chain(self.spill.iter().flat_map(|v| v.iter()))
+    }
+
+    /// Convert into a Vec (allocates only if there are events)
+    #[inline]
+    pub fn into_vec(self) -> Vec<StreamControlEvent> {
+        // Stack events come first (they were pushed first), then spilled events
+        let total_len = self.len();
+        let spill_len = self.spill.as_ref().map_or(0, |v| v.len());
+        let stack_len = total_len - spill_len;
+        
+        // Start with stack events
+        let mut result = Vec::with_capacity(total_len);
+        for i in 0..stack_len {
+            if let Some(event) = self.stack[i].clone() {
+                result.push(event);
+            }
+        }
+        
+        // Then append spilled events
+        if let Some(spill) = self.spill {
+            result.extend(spill);
+        }
+        
+        result
+    }
+
+    /// Get a slice of stack events (for testing)
+    #[cfg(test)]
+    fn stack_slice(&self) -> &[Option<StreamControlEvent>] {
+        &self.stack[..self.len]
+    }
+}
+
+impl<const N: usize> Default for SmallEventBuffer<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> IntoIterator for SmallEventBuffer<N> {
+    type Item = StreamControlEvent;
+    type IntoIter = SmallEventBufferIter<N>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SmallEventBufferIter {
+            buffer: self,
+            stack_idx: 0,
+            spill_idx: 0,
+        }
+    }
+}
+
+/// Iterator for SmallEventBuffer
+pub struct SmallEventBufferIter<const N: usize> {
+    buffer: SmallEventBuffer<N>,
+    stack_idx: usize,
+    spill_idx: usize,
+}
+
+impl<const N: usize> Iterator for SmallEventBufferIter<N> {
+    type Item = StreamControlEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // First yield stack events
+        if self.stack_idx < self.buffer.len {
+            let event = self.buffer.stack[self.stack_idx].take()?;
+            self.stack_idx += 1;
+            return Some(event);
+        }
+        // Then yield spilled events
+        if let Some(ref spill) = self.buffer.spill {
+            if self.spill_idx < spill.len() {
+                let event = spill[self.spill_idx].clone();
+                self.spill_idx += 1;
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.buffer.len - self.stack_idx
+            + self.buffer.spill.as_ref().map_or(0, |v| v.len().saturating_sub(self.spill_idx));
+        (remaining, Some(remaining))
+    }
+}
+
+impl<const N: usize> ExactSizeIterator for SmallEventBufferIter<N> {}
+
 /// Monitors streams for gaps, disconnects, and anomalies
 pub struct StreamMonitor {
     streams: Mutex<HashMap<(String, String), StreamState>>, // (source, symbol) -> state
@@ -275,9 +416,10 @@ impl StreamMonitor {
         let key = (source.clone(), symbol.clone());
         
         // Collect events while holding the lock, but emit them after releasing it
-        // to prevent deadlocks if callbacks try to access stream state
-        let events_to_emit: Vec<StreamControlEvent> = {
-            let mut events = Vec::new();
+        // to prevent deadlocks if callbacks try to access stream state.
+        // Uses SmallEventBuffer to avoid heap allocations for the common case of 0-4 events.
+        let events_to_emit: SmallEventBuffer<4> = {
+            let mut events = SmallEventBuffer::<4>::new();
             let mut streams = self.streams.lock().unwrap();
             
             if let Some(state) = streams.get_mut(&key) {
@@ -360,11 +502,12 @@ impl StreamMonitor {
         
         // Now emit events without holding the streams lock
         // This prevents deadlocks if callbacks try to access stream state
-        for event in &events_to_emit {
+        for event in events_to_emit.iter() {
             self.emit_control_event(event.clone());
         }
         
-        events_to_emit
+        // Convert to Vec for backward compatibility (only allocates if there are events)
+        events_to_emit.into_vec()
     }
 
     /// Check for silent disconnects
@@ -377,9 +520,10 @@ impl StreamMonitor {
     /// This method releases the streams lock before emitting control events to prevent
     /// deadlocks. See `process_event` documentation for details.
     pub fn check_silent_disconnects(&self) -> Vec<StreamControlEvent> {
-        // Collect disconnect events while holding the lock
-        let events_to_emit: Vec<StreamControlEvent> = {
-            let mut events = Vec::new();
+        // Collect disconnect events while holding the lock.
+        // Uses SmallEventBuffer to avoid heap allocations for the common case.
+        let events_to_emit: SmallEventBuffer<4> = {
+            let mut events = SmallEventBuffer::<4>::new();
             let mut streams = self.streams.lock().unwrap();
             
             for ((source, symbol), state) in streams.iter_mut() {
@@ -407,11 +551,12 @@ impl StreamMonitor {
         }; // streams lock is released here
         
         // Emit events without holding the streams lock
-        for event in &events_to_emit {
+        for event in events_to_emit.iter() {
             self.emit_control_event(event.clone());
         }
         
-        events_to_emit
+        // Convert to Vec for backward compatibility (only allocates if there are events)
+        events_to_emit.into_vec()
     }
 
     /// Get the current state of a stream
@@ -823,5 +968,235 @@ mod tests {
         assert!(callback_completed.load(Ordering::SeqCst), "Callback should have been invoked");
         assert!(callback_health_checks.load(Ordering::SeqCst) > 0,
             "Callback should have successfully accessed stream state");
+    }
+
+    // =========================================================================
+    // SmallEventBuffer Tests
+    // =========================================================================
+
+    #[test]
+    fn test_small_event_buffer_new_is_empty() {
+        let buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_small_event_buffer_push_single_event() {
+        let mut buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        let event = StreamControlEvent::DuplicateSequence {
+            source: "test".to_string(),
+            symbol: "AAPL".to_string(),
+            seq_no: 1,
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+        
+        buffer.push(event.clone());
+        
+        assert!(!buffer.is_empty());
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_small_event_buffer_push_multiple_events_within_capacity() {
+        let mut buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        
+        for i in 0..4 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        assert_eq!(buffer.len(), 4);
+        assert!(buffer.spill.is_none()); // Should not have spilled
+    }
+
+    #[test]
+    fn test_small_event_buffer_spills_when_capacity_exceeded() {
+        let mut buffer: SmallEventBuffer<2> = SmallEventBuffer::new();
+        
+        // Push 4 events into a buffer with capacity 2
+        for i in 0..4 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        assert_eq!(buffer.len(), 4);
+        assert!(buffer.spill.is_some()); // Should have spilled
+        assert_eq!(buffer.spill.as_ref().unwrap().len(), 2); // 2 events in spill
+    }
+
+    #[test]
+    fn test_small_event_buffer_iter() {
+        let mut buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        
+        for i in 0..3 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        let collected: Vec<_> = buffer.iter().collect();
+        assert_eq!(collected.len(), 3);
+    }
+
+    #[test]
+    fn test_small_event_buffer_iter_with_spill() {
+        let mut buffer: SmallEventBuffer<2> = SmallEventBuffer::new();
+        
+        // Push 4 events into a buffer with capacity 2
+        for i in 0..4 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        let collected: Vec<_> = buffer.iter().collect();
+        assert_eq!(collected.len(), 4);
+        
+        // Verify order is preserved (stack events first, then spill)
+        for (i, event) in collected.iter().enumerate() {
+            if let StreamControlEvent::DuplicateSequence { seq_no, .. } = event {
+                assert_eq!(*seq_no, i as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn test_small_event_buffer_into_vec_empty() {
+        let buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        let vec = buffer.into_vec();
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn test_small_event_buffer_into_vec_with_events() {
+        let mut buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        
+        for i in 0..3 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        let vec = buffer.into_vec();
+        assert_eq!(vec.len(), 3);
+    }
+
+    #[test]
+    fn test_small_event_buffer_into_vec_with_spill() {
+        let mut buffer: SmallEventBuffer<2> = SmallEventBuffer::new();
+        
+        for i in 0..5 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        let vec = buffer.into_vec();
+        assert_eq!(vec.len(), 5);
+        
+        // Verify order is preserved
+        for (i, event) in vec.iter().enumerate() {
+            if let StreamControlEvent::DuplicateSequence { seq_no, .. } = event {
+                assert_eq!(*seq_no, i as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn test_small_event_buffer_into_iter() {
+        let mut buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        
+        for i in 0..3 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        let collected: Vec<_> = buffer.into_iter().collect();
+        assert_eq!(collected.len(), 3);
+    }
+
+    #[test]
+    fn test_small_event_buffer_exact_size_iterator() {
+        let mut buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        
+        for i in 0..3 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        let iter = buffer.into_iter();
+        let (lower, upper) = iter.size_hint();
+        assert_eq!(lower, 3);
+        assert_eq!(upper, Some(3));
+        assert_eq!(iter.len(), 3);
+    }
+
+    #[test]
+    fn test_small_event_buffer_default() {
+        let buffer: SmallEventBuffer<4> = Default::default();
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_small_event_buffer_no_allocation_on_empty() {
+        // This test verifies that no heap allocation occurs for empty buffers
+        let buffer: SmallEventBuffer<4> = SmallEventBuffer::new();
+        assert!(buffer.spill.is_none());
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_small_event_buffer_large_spill() {
+        // Test with a large number of spilled events
+        let mut buffer: SmallEventBuffer<2> = SmallEventBuffer::new();
+        
+        for i in 0..100 {
+            buffer.push(StreamControlEvent::DuplicateSequence {
+                source: "test".to_string(),
+                symbol: "AAPL".to_string(),
+                seq_no: i,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            });
+        }
+        
+        assert_eq!(buffer.len(), 100);
+        let vec = buffer.into_vec();
+        assert_eq!(vec.len(), 100);
+        
+        // Verify all events are in order
+        for (i, event) in vec.iter().enumerate() {
+            if let StreamControlEvent::DuplicateSequence { seq_no, .. } = event {
+                assert_eq!(*seq_no, i as u64);
+            }
+        }
     }
 }
