@@ -138,6 +138,7 @@ mod tests {
             symbol: "MSFT".to_string(),
             event_type: MarketDataEventType::Tick,
             timestamp: "2026-05-08T10:00:00Z".to_string(),
+            source: "test-broker".to_string(),
             payload: json!({
                 "bid": 412.34,
                 "ask": 412.36

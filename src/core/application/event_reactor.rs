@@ -105,7 +105,7 @@ impl EventReactor {
                         let envelope = ReactorEvent {
                             seq_no:       seq,
                             ingestion_ts: std::time::Instant::now(),
-                            source:       "alpaca".to_string(),
+                            source:       event.source.clone(),
                             inner:        event.clone(),
                         };
 
@@ -248,6 +248,7 @@ mod tests {
             symbol: "AAPL".to_string(),
             event_type: crate::adapters::messaging::market_data_publisher::MarketDataEventType::Trade,
             timestamp: "2026-05-07T00:00:00Z".to_string(),
+            source: "alpaca".to_string(),
             payload: serde_json::json!({"price": 100}),
         };
 
@@ -259,6 +260,134 @@ mod tests {
             .expect("handler send failed");
 
         assert_eq!(received_seq, 1);
+
+        reactor.shutdown().await;
+    }
+
+    /// Test that source field from MarketDataEvent is correctly propagated to ReactorEvent
+    #[tokio::test]
+    async fn event_reactor_propagates_source_field() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SourceCapturingHandler {
+            captured_source: Mutex<Option<String>>,
+            done_tx: Mutex<Option<oneshot::Sender<()>>>,
+        }
+
+        #[async_trait]
+        impl EventHandler for SourceCapturingHandler {
+            async fn on_event(&self, event: &ReactorEvent) {
+                *self.captured_source.lock().unwrap() = Some(event.source.clone());
+                if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+
+            fn name(&self) -> &str {
+                "source-capturing-handler"
+            }
+        }
+
+        let (event_tx, event_rx) = mpsc::channel::<MarketDataEvent>(16);
+        let observability = Arc::new(TestObservability);
+        let kill_switch = Arc::new(KillSwitch::default());
+        let reactor = EventReactor::spawn(event_rx, observability, kill_switch.clone());
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let handler = Arc::new(SourceCapturingHandler {
+            captured_source: Mutex::new(None),
+            done_tx: Mutex::new(Some(done_tx)),
+        });
+
+        reactor.subscribe("AAPL", handler.clone()).await;
+
+        // Send event with a custom source (not "alpaca")
+        let event = MarketDataEvent {
+            symbol: "AAPL".to_string(),
+            event_type: crate::adapters::messaging::market_data_publisher::MarketDataEventType::Trade,
+            timestamp: "2026-05-07T00:00:00Z".to_string(),
+            source: "fix_gateway".to_string(),
+            payload: serde_json::json!({"price": 100}),
+        };
+
+        event_tx.send(event).await.unwrap();
+
+        // Wait for handler to receive event
+        let _ = tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("handler did not receive event")
+            .expect("handler send failed");
+
+        // Verify that the source was correctly propagated
+        let captured = handler.captured_source.lock().unwrap();
+        assert!(captured.is_some(), "Source should have been captured");
+        assert_eq!(captured.as_ref().unwrap(), "fix_gateway", "Source should be 'fix_gateway', not hardcoded 'alpaca'");
+
+        reactor.shutdown().await;
+    }
+
+    /// Test that different sources are handled correctly for multiple events
+    #[tokio::test]
+    async fn event_reactor_handles_multiple_sources() {
+        struct MultiSourceHandler {
+            sources: Mutex<Vec<String>>,
+            done_tx: Mutex<Option<oneshot::Sender<Vec<String>>>>,
+            expected_count: usize,
+        }
+
+        #[async_trait]
+        impl EventHandler for MultiSourceHandler {
+            async fn on_event(&self, event: &ReactorEvent) {
+                let mut sources = self.sources.lock().unwrap();
+                sources.push(event.source.clone());
+                if sources.len() >= self.expected_count {
+                    if let Some(tx) = self.done_tx.lock().unwrap().take() {
+                        let sources_copy = sources.clone();
+                        let _ = tx.send(sources_copy);
+                    }
+                }
+            }
+
+            fn name(&self) -> &str {
+                "multi-source-handler"
+            }
+        }
+
+        let (event_tx, event_rx) = mpsc::channel::<MarketDataEvent>(16);
+        let observability = Arc::new(TestObservability);
+        let kill_switch = Arc::new(KillSwitch::default());
+        let reactor = EventReactor::spawn(event_rx, observability, kill_switch.clone());
+
+        let (done_tx, done_rx) = oneshot::channel();
+        let handler = Arc::new(MultiSourceHandler {
+            sources: Mutex::new(Vec::new()),
+            done_tx: Mutex::new(Some(done_tx)),
+            expected_count: 3,
+        });
+
+        reactor.subscribe("AAPL", handler.clone()).await;
+
+        // Send events with different sources
+        let sources = vec!["alpaca", "fix_gateway", "replay"];
+        for source in &sources {
+            let event = MarketDataEvent {
+                symbol: "AAPL".to_string(),
+                event_type: crate::adapters::messaging::market_data_publisher::MarketDataEventType::Trade,
+                timestamp: "2026-05-07T00:00:00Z".to_string(),
+                source: source.to_string(),
+                payload: serde_json::json!({"price": 100}),
+            };
+            event_tx.send(event).await.unwrap();
+        }
+
+        // Wait for all events to be processed
+        let received_sources = tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("handler did not receive all events")
+            .expect("handler send failed");
+
+        // Verify that all sources were correctly propagated
+        assert_eq!(received_sources, sources, "All sources should be correctly propagated");
 
         reactor.shutdown().await;
     }

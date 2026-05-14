@@ -124,6 +124,7 @@ async fn test_no_idle_sleep_latency() {
         symbol: "TSLA".to_string(),
         event_type: broker_gateway_service::adapters::messaging::market_data_publisher::MarketDataEventType::Trade,
         timestamp: "2026-05-07T00:00:00Z".to_string(),
+        source: "alpaca".to_string(),
         payload: serde_json::json!({"price": 100.0}),
     };
 

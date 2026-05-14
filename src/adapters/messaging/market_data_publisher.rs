@@ -21,6 +21,7 @@ pub struct MarketDataEvent {
     pub symbol: String,
     pub event_type: MarketDataEventType,
     pub timestamp: String,
+    pub source: String,
     pub payload: serde_json::Value,
 }
 

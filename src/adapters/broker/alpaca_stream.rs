@@ -645,6 +645,7 @@ fn normalize_trade(frame: &Value) -> Option<MarketDataEvent> {
         symbol,
         event_type: MarketDataEventType::Trade,
         timestamp,
+        source: "alpaca".to_string(),
         payload,
     })
 }
@@ -672,6 +673,7 @@ fn normalize_quote(frame: &Value) -> Option<MarketDataEvent> {
         symbol,
         event_type: MarketDataEventType::BookUpdate,
         timestamp,
+        source: "alpaca".to_string(),
         payload,
     })
 }
@@ -698,6 +700,7 @@ fn normalize_bar(frame: &Value) -> Option<MarketDataEvent> {
         symbol,
         event_type: MarketDataEventType::Bar,
         timestamp,
+        source: "alpaca".to_string(),
         payload,
     })
 }
