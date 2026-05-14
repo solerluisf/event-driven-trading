@@ -7,6 +7,7 @@ pub enum BrokerError {
     ConnectionFailed(String),
     Unauthorized,
     RateLimited,
+    ConfigError(String),
     Unknown(String),
 }
 
@@ -25,6 +26,7 @@ impl std::fmt::Display for BrokerError {
             BrokerError::ConnectionFailed(msg)  => write!(f, "Connection failed: {}", msg),
             BrokerError::Unauthorized           => write!(f, "Unauthorized"),
             BrokerError::RateLimited            => write!(f, "Rate limited"),
+            BrokerError::ConfigError(msg)       => write!(f, "Configuration error: {}", msg),
             BrokerError::Unknown(msg)           => write!(f, "Unknown error: {}", msg),
         }
     }

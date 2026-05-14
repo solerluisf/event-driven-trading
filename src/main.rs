@@ -186,10 +186,16 @@ async fn main() {
             drop(stream_command_rx);
         }))
     } else {
-        let stream_config = AlpacaStreamConfig::from_env(
+        let stream_config = match AlpacaStreamConfig::from_env(
             cfg.market_data_feed.clone(),
             cfg.market_data_symbols.clone(),
-        );
+        ) {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Failed to load Alpaca stream configuration: {}", e);
+                std::process::exit(1);
+            }
+        };
         Some(alpaca_stream::spawn(
             stream_config,
             publisher.clone(),

@@ -45,6 +45,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{interval, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::adapters::broker::broker_error::BrokerError;
 use crate::adapters::messaging::market_data_publisher::{
     MarketDataEvent, MarketDataEventType, MarketDataPublisher,
 };
@@ -158,15 +159,24 @@ pub struct AlpacaStreamConfig {
 
 impl AlpacaStreamConfig {
     /// Load from environment variables (same vars apca uses).
-    pub fn from_env(feed: String, symbols: Vec<String>) -> Self {
-        Self {
-            api_key: std::env::var("APCA_API_KEY_ID")
-                .expect("APCA_API_KEY_ID must be set"),
-            api_secret: std::env::var("APCA_API_SECRET_KEY")
-                .expect("APCA_API_SECRET_KEY must be set"),
+    /// 
+    /// Returns `BrokerError::ConfigError` if required environment variables are not set.
+    pub fn from_env(feed: String, symbols: Vec<String>) -> Result<Self, BrokerError> {
+        let api_key = std::env::var("APCA_API_KEY_ID")
+            .map_err(|_| BrokerError::ConfigError(
+                "APCA_API_KEY_ID environment variable must be set".to_string()
+            ))?;
+        let api_secret = std::env::var("APCA_API_SECRET_KEY")
+            .map_err(|_| BrokerError::ConfigError(
+                "APCA_API_SECRET_KEY environment variable must be set".to_string()
+            ))?;
+        
+        Ok(Self {
+            api_key,
+            api_secret,
             feed,
             symbols,
-        }
+        })
     }
 }
 
@@ -947,5 +957,158 @@ mod sequence_tracker_tests {
         // purpose is the documentation above explaining the limitation.
         assert_eq!(symbols, 0);
         assert_eq!(trade_ids, 0);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AlpacaStreamConfig Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn from_env_success_with_valid_env_vars() {
+        // Set up environment variables
+        unsafe {
+            std::env::set_var("APCA_API_KEY_ID", "test_key_id");
+            std::env::set_var("APCA_API_SECRET_KEY", "test_secret_key");
+        }
+
+        let result = AlpacaStreamConfig::from_env(
+            "iex".to_string(),
+            vec!["AAPL".to_string(), "TSLA".to_string()],
+        );
+
+        // Clean up environment variables immediately after use
+        unsafe {
+            std::env::remove_var("APCA_API_KEY_ID");
+            std::env::remove_var("APCA_API_SECRET_KEY");
+        }
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.api_key, "test_key_id");
+        assert_eq!(config.api_secret, "test_secret_key");
+        assert_eq!(config.feed, "iex");
+        assert_eq!(config.symbols, vec!["AAPL", "TSLA"]);
+    }
+
+    #[test]
+    fn from_env_fails_when_api_key_missing() {
+        // Ensure environment variables are not set
+        unsafe {
+            std::env::remove_var("APCA_API_KEY_ID");
+            std::env::set_var("APCA_API_SECRET_KEY", "test_secret_key");
+        }
+
+        let result = AlpacaStreamConfig::from_env(
+            "iex".to_string(),
+            vec!["AAPL".to_string()],
+        );
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("APCA_API_SECRET_KEY");
+        }
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(err_msg.contains("APCA_API_KEY_ID"));
+        assert!(matches!(err, BrokerError::ConfigError(_)));
+    }
+
+    #[test]
+    fn from_env_fails_when_secret_key_missing() {
+        // Set only API key
+        unsafe {
+            std::env::set_var("APCA_API_KEY_ID", "test_key_id");
+            std::env::remove_var("APCA_API_SECRET_KEY");
+        }
+
+        let result = AlpacaStreamConfig::from_env(
+            "iex".to_string(),
+            vec!["AAPL".to_string()],
+        );
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("APCA_API_KEY_ID");
+        }
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = format!("{}", err);
+        assert!(err_msg.contains("APCA_API_SECRET_KEY"));
+        assert!(matches!(err, BrokerError::ConfigError(_)));
+    }
+
+    #[test]
+    fn from_env_fails_when_both_vars_missing() {
+        // Ensure both environment variables are not set
+        unsafe {
+            std::env::remove_var("APCA_API_KEY_ID");
+            std::env::remove_var("APCA_API_SECRET_KEY");
+        }
+
+        let result = AlpacaStreamConfig::from_env(
+            "iex".to_string(),
+            vec!["AAPL".to_string()],
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, BrokerError::ConfigError(_)));
+    }
+
+    #[test]
+    fn config_allows_empty_symbols_list() {
+        // Set up environment variables
+        unsafe {
+            std::env::set_var("APCA_API_KEY_ID", "test_key_id");
+            std::env::set_var("APCA_API_SECRET_KEY", "test_secret_key");
+        }
+
+        let result = AlpacaStreamConfig::from_env(
+            "test".to_string(),
+            vec![], // Empty symbols list
+        );
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("APCA_API_KEY_ID");
+            std::env::remove_var("APCA_API_SECRET_KEY");
+        }
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert!(config.symbols.is_empty());
+    }
+
+    #[test]
+    fn config_supports_wildcard_symbol() {
+        // Set up environment variables
+        unsafe {
+            std::env::set_var("APCA_API_KEY_ID", "test_key_id");
+            std::env::set_var("APCA_API_SECRET_KEY", "test_secret_key");
+        }
+
+        let result = AlpacaStreamConfig::from_env(
+            "sip".to_string(),
+            vec!["*".to_string()], // Subscribe to all symbols
+        );
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("APCA_API_KEY_ID");
+            std::env::remove_var("APCA_API_SECRET_KEY");
+        }
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.symbols, vec!["*"]);
+        assert_eq!(config.feed, "sip");
     }
 }
