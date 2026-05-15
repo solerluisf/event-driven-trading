@@ -13,6 +13,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::core::infrastructure::MutexExt;
 use crate::core::ports::observability::IObservability;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,7 +62,7 @@ impl CircuitBreaker {
         F: FnOnce() -> Result<T, String>,
     {
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.safe_lock();
             match &g.state {
                 State::Open { until } => {
                     if Instant::now() < *until {
@@ -100,7 +101,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_success(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.safe_lock();
         let was_half_open = g.state == State::HalfOpen;
         g.failures = 0;
         g.state = State::Closed;
@@ -112,7 +113,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_failure<E: std::fmt::Display>(&self, err: &E) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.safe_lock();
         g.failures += 1;
         let msg = format!(
             "circuit_breaker.failure broker={} failures={} err={}",
@@ -136,7 +137,7 @@ impl CircuitBreaker {
     }
 
     pub fn is_open(&self) -> bool {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.safe_lock();
         matches!(&g.state, State::Open { until } if Instant::now() < *until)
     }
 }

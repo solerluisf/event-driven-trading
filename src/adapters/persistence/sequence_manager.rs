@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use crate::core::infrastructure::MutexExt;
 
 /// Errors that can occur in sequence management
 #[derive(Debug, Clone, PartialEq)]
@@ -203,7 +204,7 @@ impl SequenceManager {
     /// Validation result indicating if the sequence is valid, a gap, duplicate, etc.
     pub fn process(&self, stream_id: impl Into<String>, seq_no: u64) -> SequenceValidation {
         let stream_id = stream_id.into();
-        let mut streams = self.streams.lock().unwrap();
+        let mut streams = self.streams.safe_lock();
         
         if let Some(stream) = streams.get_mut(&stream_id) {
             stream.process(seq_no)
@@ -217,49 +218,49 @@ impl SequenceManager {
 
     /// Get the next expected sequence number for a stream
     pub fn next_expected(&self, stream_id: &str) -> Option<u64> {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.get(stream_id).map(|s| s.next_expected())
     }
 
     /// Get statistics for a stream
     pub fn get_stats(&self, stream_id: &str) -> Option<StreamStats> {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.get(stream_id).map(|s| s.stats())
     }
 
     /// Reset tracking for a stream
     pub fn reset_stream(&self, stream_id: &str) {
-        let mut streams = self.streams.lock().unwrap();
+        let mut streams = self.streams.safe_lock();
         streams.remove(stream_id);
     }
 
     /// Reset all streams
     pub fn reset_all(&self) {
-        let mut streams = self.streams.lock().unwrap();
+        let mut streams = self.streams.safe_lock();
         streams.clear();
     }
 
     /// Get all tracked stream IDs
     pub fn get_streams(&self) -> Vec<String> {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.keys().cloned().collect()
     }
 
     /// Get total number of tracked streams
     pub fn stream_count(&self) -> usize {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.len()
     }
 
     /// Get total gaps across all streams
     pub fn total_gaps(&self) -> u64 {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.values().map(|s| s.stats().gap_count).sum()
     }
 
     /// Get total duplicates across all streams
     pub fn total_duplicates(&self) -> u64 {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.values().map(|s| s.stats().duplicate_count).sum()
     }
 

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
+use crate::core::infrastructure::MutexExt;
 
 /// Unique identifier for tracing requests across the system
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -172,19 +173,19 @@ impl TelemetryDecorator {
     where
         F: Fn(TelemetryEvent) + Send + Sync + 'static,
     {
-        let mut cb = self.callback.lock().unwrap();
+        let mut cb = self.callback.safe_lock();
         *cb = Some(Arc::new(callback));
     }
 
     /// Check if a callback is registered
     pub fn has_callback(&self) -> bool {
-        self.callback.lock().unwrap().is_some()
+        self.callback.safe_lock().is_some()
     }
 
     /// Start tracking an operation and return a trace ID
     pub fn start_operation(&self, operation: impl Into<String>) -> TraceId {
         let trace_id = TraceId::new();
-        let mut ops = self.active_operations.lock().unwrap();
+        let mut ops = self.active_operations.safe_lock();
         ops.insert(trace_id.clone(), (operation.into(), Instant::now()));
         trace_id
     }
@@ -198,7 +199,7 @@ impl TelemetryDecorator {
         response_size: usize,
         error: Option<(String, String)>,
     ) {
-        let mut ops = self.active_operations.lock().unwrap();
+        let mut ops = self.active_operations.safe_lock();
         if let Some((operation, start_time)) = ops.remove(&trace_id) {
             let end_time = Instant::now();
             let latency = end_time.duration_since(start_time);
@@ -472,14 +473,14 @@ impl TelemetryDecorator {
 
     /// Emit a structured telemetry event
     pub fn emit_event(&self, event: TelemetryEvent) {
-        if let Some(callback) = self.callback.lock().unwrap().as_ref() {
+        if let Some(callback) = self.callback.safe_lock().as_ref() {
             callback(event);
         }
     }
 
     /// Get the number of active operations
     pub fn active_operation_count(&self) -> usize {
-        self.active_operations.lock().unwrap().len()
+        self.active_operations.safe_lock().len()
     }
 
     /// Get all active trace IDs
@@ -565,7 +566,7 @@ mod tests {
         let received_clone = received_event.clone();
         
         decorator.register_callback(move |event| {
-            *received_clone.lock().unwrap() = Some(event);
+            *received_clone.safe_lock() = Some(event);
         });
         
         let trace_id = decorator.start_operation("my_operation");
@@ -579,7 +580,7 @@ mod tests {
             None,
         );
         
-        let event = received_event.lock().unwrap().clone().expect("Event should be received");
+        let event = received_event.safe_lock().clone().expect("Event should be received");
         assert_eq!(event.operation, "my_operation");
         assert_eq!(event.status_code, Some(200));
         assert_eq!(event.request_payload_size, 100);
@@ -594,7 +595,7 @@ mod tests {
         let received_clone = received_event.clone();
         
         decorator.register_callback(move |event| {
-            *received_clone.lock().unwrap() = Some(event);
+            *received_clone.safe_lock() = Some(event);
         });
         
         let trace_id = decorator.start_operation("failing_op");
@@ -606,7 +607,7 @@ mod tests {
             Some(("ConnectionError".to_string(), "Failed to connect".to_string())),
         );
         
-        let event = received_event.lock().unwrap().clone().expect("Event should be received");
+        let event = received_event.safe_lock().clone().expect("Event should be received");
         assert!(!event.success);
         assert_eq!(event.error_type, Some("ConnectionError".to_string()));
         assert_eq!(event.error_message, Some("Failed to connect".to_string()));
@@ -711,12 +712,12 @@ mod tests {
         let received_clone = received.clone();
         
         decorator.register_callback(move |event| {
-            *received_clone.lock().unwrap() = Some(event);
+            *received_clone.safe_lock() = Some(event);
         });
         
         decorator.emit_telemetry("some event");
         
-        let event = received.lock().unwrap().clone().expect("Event should be received");
+        let event = received.safe_lock().clone().expect("Event should be received");
         assert!(!event.success); // Legacy events marked as failed
         assert_eq!(event.error_message, Some("some event".to_string()));
     }
@@ -766,7 +767,7 @@ mod tests {
         let received_clone = received.clone();
         
         decorator.register_callback(move |event| {
-            *received_clone.lock().unwrap() = Some(event);
+            *received_clone.safe_lock() = Some(event);
         });
         
         let (result, event) = decorator.wrap_outbound_result(
@@ -783,7 +784,7 @@ mod tests {
         assert!(event.latency > Duration::from_nanos(0));
         
         // Verify callback received the event
-        let received_event = received.lock().unwrap().clone().expect("Event should be received");
+        let received_event = received.safe_lock().clone().expect("Event should be received");
         assert!(received_event.success);
     }
 
@@ -794,7 +795,7 @@ mod tests {
         let received_clone = received.clone();
         
         decorator.register_callback(move |event| {
-            *received_clone.lock().unwrap() = Some(event);
+            *received_clone.safe_lock() = Some(event);
         });
         
         let (result, event) = decorator.wrap_outbound_result(
@@ -810,7 +811,7 @@ mod tests {
         assert_eq!(event.error_message, Some("Rate limit exceeded".to_string()));
         
         // Verify callback received the error event
-        let received_event = received.lock().unwrap().clone().expect("Event should be received");
+        let received_event = received.safe_lock().clone().expect("Event should be received");
         assert!(!received_event.success);
         assert_eq!(received_event.error_type, Some("rate_limited".to_string()));
     }

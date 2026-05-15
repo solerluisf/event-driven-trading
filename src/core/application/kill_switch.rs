@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use crate::core::domain::order::ExecutionId;
+use crate::core::infrastructure::MutexExt;
 use crate::adapters::broker::broker_error::BrokerError;
 
 /// Type alias for the cancel callback function
@@ -102,7 +103,7 @@ impl KillSwitch {
 
     /// Check if the kill switch is enabled
     pub fn is_enabled(&self) -> bool {
-        self.inner.lock().unwrap().enabled
+        self.inner.safe_lock().enabled
     }
 
     /// Enable the kill switch and cancel all open orders
@@ -116,7 +117,7 @@ impl KillSwitch {
         // Collect all data needed while holding the lock, then release it
         // before calling callbacks to prevent potential deadlocks.
         let (order_count, orders_to_cancel, cancel_callback, cancel_channel) = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.safe_lock();
 
             if inner.enabled {
                 tracing::warn!("Kill switch already enabled, {} open orders remain", inner.open_orders.len());
@@ -164,7 +165,7 @@ impl KillSwitch {
     /// Disabling the kill switch allows new orders to flow again.
     /// This should only be done after manual review.
     pub fn disable(&self) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.safe_lock();
         inner.enabled = false;
         tracing::info!("Kill switch deactivated - new orders will be accepted");
     }
@@ -192,7 +193,7 @@ impl KillSwitch {
     where
         F: Fn(ExecutionId) + Send + Sync + 'static,
     {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.safe_lock();
         inner.cancel_callback = Some(Arc::new(callback));
         tracing::debug!("Kill switch cancel callback registered");
     }
@@ -220,7 +221,7 @@ impl KillSwitch {
     /// ```
     pub fn register_cancel_channel(&self) -> Receiver<ExecutionId> {
         let (tx, rx) = mpsc::channel::<ExecutionId>(100);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.safe_lock();
         inner.cancel_channel = Some(CancelChannel(tx));
         tracing::debug!("Kill switch cancel channel registered");
         rx
@@ -235,7 +236,7 @@ impl KillSwitch {
     /// - `true` if the order was newly added
     /// - `false` if the order was already tracked
     pub fn track_open_order(&self, execution_id: &ExecutionId) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.safe_lock();
         let added = inner.open_orders.insert(execution_id.0.clone());
         if added {
             tracing::debug!("Tracking open order: {}", execution_id.0);
@@ -252,7 +253,7 @@ impl KillSwitch {
     /// - `true` if the order was removed
     /// - `false` if the order was not being tracked
     pub fn remove_open_order(&self, execution_id: &ExecutionId) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.safe_lock();
         let removed = inner.open_orders.remove(&execution_id.0);
         if removed {
             tracing::debug!("Order no longer tracked: {}", execution_id.0);
@@ -262,7 +263,7 @@ impl KillSwitch {
 
     /// Get the number of currently tracked open orders
     pub fn open_order_count(&self) -> usize {
-        self.inner.lock().unwrap().open_orders.len()
+        self.inner.safe_lock().open_orders.len()
     }
 
     /// Get a list of all tracked open orders
@@ -277,7 +278,7 @@ impl KillSwitch {
 
     /// Check if a specific order is being tracked
     pub fn is_order_tracked(&self, execution_id: &ExecutionId) -> bool {
-        self.inner.lock().unwrap().open_orders.contains(&execution_id.0)
+        self.inner.safe_lock().open_orders.contains(&execution_id.0)
     }
 }
 
@@ -431,7 +432,7 @@ mod tests {
         // Spawn a task to collect cancellations
         let collector = tokio::spawn(async move {
             while let Some(exec_id) = cancel_rx.recv().await {
-                cancelled_clone.lock().unwrap().push(exec_id.0);
+                cancelled_clone.safe_lock().push(exec_id.0);
             }
         });
 
@@ -445,7 +446,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Check results
-        let orders = cancelled.lock().unwrap();
+        let orders = cancelled.safe_lock();
         assert_eq!(orders.len(), 2);
         assert!(orders.contains(&"async-order-1".to_string()));
         assert!(orders.contains(&"async-order-2".to_string()));

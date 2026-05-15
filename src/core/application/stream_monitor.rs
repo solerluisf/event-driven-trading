@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use serde::{Serialize, Deserialize};
+use crate::core::infrastructure::MutexExt;
 
 /// Control event types emitted when stream issues are detected
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -375,14 +376,14 @@ impl StreamMonitor {
     where
         F: Fn(StreamControlEvent) + Send + Sync + 'static,
     {
-        let mut cb = self.control_event_callback.lock().unwrap();
+        let mut cb = self.control_event_callback.safe_lock();
         *cb = Some(Box::new(callback));
     }
 
     /// Emit a control event if callback is registered
     fn emit_control_event(&self, event: StreamControlEvent) {
         if self.config.emit_control_events {
-            if let Some(callback) = self.control_event_callback.lock().unwrap().as_ref() {
+            if let Some(callback) = self.control_event_callback.safe_lock().as_ref() {
                 callback(event);
             }
         }
@@ -420,7 +421,7 @@ impl StreamMonitor {
         // Uses SmallEventBuffer to avoid heap allocations for the common case of 0-4 events.
         let events_to_emit: SmallEventBuffer<4> = {
             let mut events = SmallEventBuffer::<4>::new();
-            let mut streams = self.streams.lock().unwrap();
+            let mut streams = self.streams.safe_lock();
             
             if let Some(state) = streams.get_mut(&key) {
                 // Check for duplicates first
@@ -524,7 +525,7 @@ impl StreamMonitor {
         // Uses SmallEventBuffer to avoid heap allocations for the common case.
         let events_to_emit: SmallEventBuffer<4> = {
             let mut events = SmallEventBuffer::<4>::new();
-            let mut streams = self.streams.lock().unwrap();
+            let mut streams = self.streams.safe_lock();
             
             for ((source, symbol), state) in streams.iter_mut() {
                 if state.is_healthy {
@@ -561,7 +562,7 @@ impl StreamMonitor {
 
     /// Get the current state of a stream
     pub fn get_stream_state(&self, source: &str, symbol: &str) -> Option<StreamHealth> {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.get(&(source.to_string(), symbol.to_string())).map(|s| StreamHealth {
             is_healthy: s.is_healthy,
             last_seq_no: s.last_seq_no,
@@ -573,13 +574,13 @@ impl StreamMonitor {
 
     /// Get all monitored streams
     pub fn get_monitored_streams(&self) -> Vec<(String, String)> {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         streams.keys().cloned().collect()
     }
 
     /// Get statistics for all streams
     pub fn get_statistics(&self) -> StreamStatistics {
-        let streams = self.streams.lock().unwrap();
+        let streams = self.streams.safe_lock();
         StreamStatistics {
             total_streams: streams.len(),
             healthy_streams: streams.values().filter(|s| s.is_healthy).count(),
@@ -590,7 +591,7 @@ impl StreamMonitor {
 
     /// Reset the monitor (clear all state)
     pub fn reset(&self) {
-        let mut streams = self.streams.lock().unwrap();
+        let mut streams = self.streams.safe_lock();
         streams.clear();
     }
 }

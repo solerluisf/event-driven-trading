@@ -9,7 +9,7 @@ use crate::adapters::broker::broker_error::BrokerError;
 use crate::adapters::broker::alpaca_adapter::AlpacaBrokerAdapter;
 use crate::adapters::broker::mock_adapter::MockAdapter;
 use crate::adapters::broker::replay_adapter::{ReplayBrokerAdapter, ReplayConfig};
-
+use crate::core::infrastructure::MutexExt;
 
 use std::sync::{Arc, Mutex};
 use apca::Client;
@@ -73,8 +73,7 @@ impl AdapterFactory {
     /// Check if the Alpaca client is available for creating an adapter
     pub fn is_alpaca_client_available(&self) -> bool {
         self.alpaca_client
-            .lock()
-            .unwrap()
+            .safe_lock()
             .is_some()
     }
 
@@ -102,8 +101,7 @@ impl AdapterFactory {
         match config.name.as_str() {
             "alpaca" => {
                 let client = self.alpaca_client
-                    .lock()
-                    .unwrap()
+                    .safe_lock()
                     .take()
                     .ok_or(AdapterFactoryError::AlpacaClientAlreadyUsed)?;
                 Ok(Box::new(AlpacaBrokerAdapter::new(client)))
@@ -183,8 +181,7 @@ impl AdapterFactory {
         match config.name.as_str() {
             "alpaca" => {
                 let client = self.alpaca_client
-                    .lock()
-                    .unwrap()
+                    .safe_lock()
                     .take()
                     .expect("alpaca client not provided or already used");
                 Box::new(AlpacaBrokerAdapter::new(client))

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
+use crate::core::infrastructure::MutexExt;
 
 /// Back-pressure status for a broker's rate limiter.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -97,7 +98,7 @@ impl RateLimiterManager {
 
     /// Returns true if the broker has enough tokens for `tokens` requests.
     pub fn allow(&self, broker_id: &str, tokens: u32) -> bool {
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.safe_lock();
         let refill_rate = self.default_rpm / 60.0;
         let bucket = buckets
             .entry(broker_id.to_string())
@@ -108,7 +109,7 @@ impl RateLimiterManager {
     /// Get the current back-pressure status for a broker.
     /// Returns None if the broker has no bucket (hasn't been used yet).
     pub fn get_back_pressure_status(&self, broker_id: &str, near_limit_threshold_percent: f64) -> Option<BackPressureStatus> {
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.safe_lock();
         let refill_rate = self.default_rpm / 60.0;
         let bucket = buckets
             .entry(broker_id.to_string())
@@ -140,7 +141,7 @@ impl RateLimiterManager {
     /// Get the current token count for a broker.
     /// Returns 0.0 if the broker has no bucket.
     pub fn tokens_remaining(&self, broker_id: &str) -> f64 {
-        let mut buckets = self.buckets.lock().unwrap();
+        let mut buckets = self.buckets.safe_lock();
         let refill_rate = self.default_rpm / 60.0;
         let bucket = buckets
             .entry(broker_id.to_string())
@@ -154,7 +155,7 @@ impl RateLimiterManager {
     /// Get the capacity for a broker.
     /// Returns default_rpm if the broker has no bucket.
     pub fn get_capacity(&self, broker_id: &str) -> f64 {
-        let buckets = self.buckets.lock().unwrap();
+        let buckets = self.buckets.safe_lock();
         buckets
             .get(broker_id)
             .map(|b| b.capacity)
