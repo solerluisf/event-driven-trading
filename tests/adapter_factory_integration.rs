@@ -22,17 +22,23 @@ fn test_factory_reusable_for_mock_adapters() {
 }
 
 #[test]
-fn test_factory_reusable_for_fix_adapters() {
+fn test_factory_returns_not_implemented_for_fix_adapters() {
     let factory = AdapterFactory::new(None);
     
-    // Factory should be reusable for FIX adapters
+    // FIX adapter is not implemented - factory should return error
     for i in 0..5 {
         let config = BrokerConfig {
             name: "fix".to_string(),
         };
         
-        let adapter = factory.create_adapter(config);
-        assert!(adapter.is_ok(), "Factory should be reusable for FIX, failed on iteration {}", i);
+        let result = factory.create_adapter(config);
+        assert!(result.is_err(), "Factory should return error for FIX on iteration {}", i);
+        match result {
+            Err(AdapterFactoryError::AdapterNotImplemented { broker }) => {
+                assert_eq!(broker, "fix");
+            }
+            _ => panic!("Expected AdapterNotImplemented error for FIX"),
+        }
     }
 }
 
@@ -73,18 +79,30 @@ fn test_error_message_clearly_indicates_problem() {
 fn test_factory_can_create_different_adapter_types() {
     let factory = AdapterFactory::new(None);
     
-    // Create one of each non-alpaca adapter type
-    let configs = vec![
-        BrokerConfig { name: "mock".to_string() },
+    // Test mock adapter (should succeed)
+    let mock_config = BrokerConfig { name: "mock".to_string() };
+    assert!(factory.create_adapter(mock_config).is_ok(), "Failed to create mock adapter");
+    
+    // Test unknown adapter (falls back to mock, should succeed)
+    let unknown_config = BrokerConfig { name: "unknown".to_string() };
+    assert!(factory.create_adapter(unknown_config).is_ok(), "Failed to create unknown adapter");
+    
+    // Test unimplemented adapters (should return NotImplemented error)
+    let unimplemented_configs = vec![
         BrokerConfig { name: "fix".to_string() },
         BrokerConfig { name: "rest".to_string() },
         BrokerConfig { name: "websocket".to_string() },
-        BrokerConfig { name: "unknown".to_string() }, // Falls back to mock
     ];
     
-    for config in configs {
-        let adapter = factory.create_adapter(config.clone());
-        assert!(adapter.is_ok(), "Failed to create adapter for {}", config.name);
+    for config in unimplemented_configs {
+        let result = factory.create_adapter(config.clone());
+        assert!(result.is_err(), "Should fail to create adapter for {}", config.name);
+        match result {
+            Err(AdapterFactoryError::AdapterNotImplemented { broker }) => {
+                assert_eq!(broker, config.name);
+            }
+            _ => panic!("Expected AdapterNotImplemented error for {}", config.name),
+        }
     }
 }
 

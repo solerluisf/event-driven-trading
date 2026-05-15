@@ -8,9 +8,6 @@ use crate::core::ports::journal_repo::IJournalRepo;
 use crate::adapters::broker::broker_error::BrokerError;
 use crate::adapters::broker::alpaca_adapter::AlpacaBrokerAdapter;
 use crate::adapters::broker::mock_adapter::MockAdapter;
-use crate::adapters::broker::fix_adapter::FixBrokerAdapter;
-use crate::adapters::broker::rest_adapter::RestBrokerAdapter;
-use crate::adapters::broker::websocket_adapter::WebSocketBrokerAdapter;
 use crate::adapters::broker::replay_adapter::{ReplayBrokerAdapter, ReplayConfig};
 
 
@@ -26,6 +23,8 @@ pub enum AdapterFactoryError {
     AlpacaClientAlreadyUsed,
     /// Journal was not provided but is required for replay mode
     JournalNotAvailable,
+    /// The requested broker adapter is not yet implemented
+    AdapterNotImplemented { broker: String },
 }
 
 impl std::fmt::Display for AdapterFactoryError {
@@ -39,6 +38,9 @@ impl std::fmt::Display for AdapterFactoryError {
             }
             AdapterFactoryError::JournalNotAvailable => {
                 write!(f, "Journal not available but required for replay mode")
+            }
+            AdapterFactoryError::AdapterNotImplemented { broker } => {
+                write!(f, "Broker adapter '{}' is not yet implemented", broker)
             }
         }
     }
@@ -106,10 +108,18 @@ impl AdapterFactory {
                     .ok_or(AdapterFactoryError::AlpacaClientAlreadyUsed)?;
                 Ok(Box::new(AlpacaBrokerAdapter::new(client)))
             },
-            "fix"       => Ok(Box::new(FixBrokerAdapter::default())),
-            "rest"      => Ok(Box::new(RestBrokerAdapter::default())),
-            "websocket" => Ok(Box::new(WebSocketBrokerAdapter::default())),
-            _           => Ok(Box::new(MockAdapter::default())),
+            // These adapters are placeholders and will panic if used (todo!())
+            // Return an error instead to prevent runtime panics
+            "fix" => Err(AdapterFactoryError::AdapterNotImplemented { 
+                broker: "fix".to_string() 
+            }),
+            "rest" => Err(AdapterFactoryError::AdapterNotImplemented { 
+                broker: "rest".to_string() 
+            }),
+            "websocket" => Err(AdapterFactoryError::AdapterNotImplemented { 
+                broker: "websocket".to_string() 
+            }),
+            _ => Ok(Box::new(MockAdapter::default())),
         }
     }
 
@@ -163,6 +173,7 @@ impl AdapterFactory {
     /// 
     /// # Panics
     /// Panics if the Alpaca client is not available or already used.
+    /// Also panics for unimplemented adapters (fix, rest, websocket).
     /// Use `create_adapter` for error handling instead.
     #[deprecated(since = "0.1.0", note = "Use create_adapter instead")]
     pub fn create_adapter_panic(
@@ -178,10 +189,10 @@ impl AdapterFactory {
                     .expect("alpaca client not provided or already used");
                 Box::new(AlpacaBrokerAdapter::new(client))
             },
-            "fix"       => Box::new(FixBrokerAdapter::default()),
-            "rest"      => Box::new(RestBrokerAdapter::default()),
-            "websocket" => Box::new(WebSocketBrokerAdapter::default()),
-            _           => Box::new(MockAdapter::default()),
+            "fix" => panic!("FixBrokerAdapter is not yet implemented - use create_adapter() for proper error handling"),
+            "rest" => panic!("RestBrokerAdapter is not yet implemented - use create_adapter() for proper error handling"),
+            "websocket" => panic!("WebSocketBrokerAdapter is not yet implemented - use create_adapter() for proper error handling"),
+            _ => Box::new(MockAdapter::default()),
         }
     }
 }
@@ -238,36 +249,54 @@ mod tests {
     }
 
     #[test]
-    fn test_create_fix_adapter_succeeds() {
+    fn test_create_fix_adapter_returns_not_implemented_error() {
         let factory = AdapterFactory::new(None);
         let config = BrokerConfig {
             name: "fix".to_string(),
         };
 
-        let adapter = factory.create_adapter(config);
-        assert!(adapter.is_ok());
+        let result = factory.create_adapter(config);
+        assert!(result.is_err());
+        match result {
+            Err(AdapterFactoryError::AdapterNotImplemented { broker }) => {
+                assert_eq!(broker, "fix");
+            }
+            _ => panic!("Expected AdapterNotImplemented error for 'fix'"),
+        }
     }
 
     #[test]
-    fn test_create_rest_adapter_succeeds() {
+    fn test_create_rest_adapter_returns_not_implemented_error() {
         let factory = AdapterFactory::new(None);
         let config = BrokerConfig {
             name: "rest".to_string(),
         };
 
-        let adapter = factory.create_adapter(config);
-        assert!(adapter.is_ok());
+        let result = factory.create_adapter(config);
+        assert!(result.is_err());
+        match result {
+            Err(AdapterFactoryError::AdapterNotImplemented { broker }) => {
+                assert_eq!(broker, "rest");
+            }
+            _ => panic!("Expected AdapterNotImplemented error for 'rest'"),
+        }
     }
 
     #[test]
-    fn test_create_websocket_adapter_succeeds() {
+    fn test_create_websocket_adapter_returns_not_implemented_error() {
         let factory = AdapterFactory::new(None);
         let config = BrokerConfig {
             name: "websocket".to_string(),
         };
 
-        let adapter = factory.create_adapter(config);
-        assert!(adapter.is_ok());
+        let result = factory.create_adapter(config);
+        assert!(result.is_err());
+        match result {
+            Err(AdapterFactoryError::AdapterNotImplemented { broker }) => {
+                assert_eq!(broker, "websocket");
+            }
+            _ => panic!("Expected AdapterNotImplemented error for 'websocket'"),
+        }
     }
 
     #[test]
@@ -319,10 +348,15 @@ mod tests {
         let not_provided = AdapterFactoryError::AlpacaClientNotProvided;
         let already_used = AdapterFactoryError::AlpacaClientAlreadyUsed;
         let journal_not_available = AdapterFactoryError::JournalNotAvailable;
+        let not_implemented = AdapterFactoryError::AdapterNotImplemented { 
+            broker: "test".to_string() 
+        };
 
         assert!(not_provided.to_string().contains("not provided"));
         assert!(already_used.to_string().contains("already consumed"));
         assert!(journal_not_available.to_string().contains("Journal not available"));
+        assert!(not_implemented.to_string().contains("not yet implemented"));
+        assert!(not_implemented.to_string().contains("test"));
     }
 
     #[test]
