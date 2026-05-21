@@ -20,6 +20,11 @@ use crate::adapters::messaging::bus_adapter::BusAdapter;
 use crate::adapters::messaging::market_data_publisher::{MarketDataEvent, MarketDataPublisher};
 use crate::adapters::messaging::order_lifecycle_publisher::OrderLifecyclePublisher;
 use crate::adapters::messaging::wire_codec::wire_codec_metrics_snapshot;
+use crate::adapters::messaging::heartbeat_publisher::HeartbeatPublisher;
+use crate::adapters::messaging::kill_switch_subscriber::KillSwitchSubscriber;
+use crate::adapters::messaging::mode_subscriber::ModeSubscriber;
+use crate::adapters::messaging::circuit_breaker_publisher::CircuitBreakerPublisher;
+use crate::adapters::messaging::orchestration_handler::OrchestrationHandler;
 use crate::adapters::metrics::metrics_adapter::MetricsAdapter;
 use crate::adapters::persistence::journal_storage::JournalStorage;
 use crate::core::application::event_reactor::EventReactor;
@@ -90,7 +95,7 @@ async fn main() {
     info!("wire codec: MessagePack only (JSON fallback removed)");
 
     // ── Shared infrastructure ─────────────────────────────────────────────────
-    let metrics = Arc::new(MetricsAdapter);
+    let metrics = Arc::new(MetricsAdapter::default());
     let journal = Arc::new(JournalStorage::new());
     let kill_switch = Arc::new(KillSwitch::default());
     let rate_limiter = Arc::new(RateLimiterManager::new(cfg.rate_limit_rpm));
@@ -206,6 +211,63 @@ async fn main() {
         ))
     };
 
+    // ── Orchestrator integration ────────────────────────────────────────────────
+
+    // Heartbeat publisher — sends GatewayHealthSnapshot every 5s
+    let (heartbeat_tx, heartbeat_handle) = HeartbeatPublisher::spawn(&cfg.health_pub_endpoint);
+
+    // Kill-switch subscriber (from Orchestrator broadcasts)
+    let kill_switch_subscriber = KillSwitchSubscriber::spawn(
+        &cfg.orchestrator_events_endpoint,
+        Arc::clone(&kill_switch),
+    );
+
+    // Mode subscriber (from Orchestrator broadcasts)
+    let mode_subscriber = ModeSubscriber::spawn(&cfg.orchestrator_events_endpoint);
+
+    // Circuit breaker publisher
+    let (_cb_tx, cb_handle) = CircuitBreakerPublisher::spawn(&cfg.circuit_breaker_pub_endpoint);
+
+    // Orchestration command handler
+    let (_orchestration_handler, orchestration_handle) = OrchestrationHandler::spawn(
+        &cfg.orchestrator_control_endpoint,
+        Arc::clone(&kill_switch),
+        Arc::clone(&circuit_breaker),
+        Arc::clone(&rate_limiter),
+        cfg.broker.clone(),
+    );
+
+    // Health heartbeat task — collects snapshot and sends to publisher
+    let health_snapshot_task = {
+        let kill_switch = Arc::clone(&kill_switch);
+        let circuit_breaker = Arc::clone(&circuit_breaker);
+        let rate_limiter = Arc::clone(&rate_limiter);
+        let broker_id = cfg.broker.clone();
+        let symbols = cfg.market_data_symbols.clone();
+        tokio::spawn(async move {
+            use crate::core::domain::gateway_health::GatewayHealthSnapshot;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let cb_state = if circuit_breaker.is_open() {
+                    "open"
+                } else {
+                    "closed"
+                };
+                let snapshot = GatewayHealthSnapshot::new("broker_gateway")
+                    .with_kill_switch(kill_switch.is_enabled())
+                    .with_operation_mode(cfg.operation_mode.to_string())
+                    .with_circuit_breaker_state(cb_state)
+                    .with_rate_limiter(
+                        rate_limiter.tokens_remaining(&broker_id),
+                        rate_limiter.get_capacity(&broker_id),
+                    )
+                    .with_symbols(symbols.clone());
+                let _ = heartbeat_tx.send(snapshot).await;
+            }
+        })
+    };
+
     // ── ZeroMQ REP listener ───────────────────────────────────────────────────
     let bus = BusAdapter::new(
         &cfg.zmq_rep_endpoint,
@@ -223,8 +285,7 @@ async fn main() {
         initial_wire_metrics.encode_error_total
     );
 
-    // Run all four concurrently; stop if any fails
-    // In offline mode, stream_handle is a dummy task that completes immediately
+    // Run all tasks concurrently; stop if any fails
     tokio::select! {
         result = bus.listen() => {
             if let Err(e) = result {
@@ -251,6 +312,24 @@ async fn main() {
         } => {
             error!("Market data stream task exited unexpectedly");
             std::process::exit(1);
+        }
+        _ = heartbeat_handle => {
+            error!("Heartbeat publisher exited");
+        }
+        _ = kill_switch_subscriber => {
+            error!("Kill switch subscriber exited");
+        }
+        _ = mode_subscriber => {
+            error!("Mode subscriber exited");
+        }
+        _ = cb_handle => {
+            error!("Circuit breaker publisher exited");
+        }
+        _ = orchestration_handle => {
+            error!("Orchestration handler exited");
+        }
+        _ = health_snapshot_task => {
+            error!("Health snapshot task exited");
         }
     }
 }

@@ -20,6 +20,10 @@
 //   GATEWAY_ISOLATE_BULK_OPS             true                   isolate bulk operations on separate threads
 //   GATEWAY_MAX_CONCURRENT_BULK          3                      max concurrent bulk operations
 //   GATEWAY_PER_WORKLOAD_RATE_LIMIT      true                   enable per-workload rate limiting
+//   ORCHESTRATOR_CONTROL_ENDPOINT        tcp://127.0.0.1:5560   orchestrator control commands (SUB)
+//   ORCHESTRATOR_EVENTS_ENDPOINT         tcp://127.0.0.1:5561   orchestrator system events (SUB)
+//   HEALTH_PUB_ENDPOINT                  tcp://127.0.0.1:5562   gateway health heartbeats (PUB)
+//   CIRCUIT_BREAKER_PUB_ENDPOINT         tcp://127.0.0.1:5563   circuit breaker state events (PUB)
 
 use std::env;
 use crate::core::domain::operation_mode::{OperationMode, WorkloadConfig};
@@ -54,6 +58,14 @@ pub struct AppConfig {
     pub operation_mode: OperationMode,
     /// Workload configuration for separating live vs bulk/offline operations
     pub workload_config: WorkloadConfig,
+    /// Orchestrator control endpoint (SUB) — receives commands from orchestrator
+    pub orchestrator_control_endpoint: String,
+    /// Orchestrator events endpoint (SUB) — receives system events (kill switch, mode)
+    pub orchestrator_events_endpoint: String,
+    /// Health publisher endpoint (PUB) — publishes health heartbeats
+    pub health_pub_endpoint: String,
+    /// Circuit breaker publisher endpoint (PUB) — publishes CB state changes
+    pub circuit_breaker_pub_endpoint: String,
 }
 
 impl AppConfig {
@@ -77,6 +89,10 @@ impl AppConfig {
             market_data_symbols: env_symbol_list("MARKET_DATA_SYMBOLS", &["AAPL", "SPY"]),
             operation_mode,
             workload_config,
+            orchestrator_control_endpoint: env_str("ORCHESTRATOR_CONTROL_ENDPOINT", "tcp://127.0.0.1:5560"),
+            orchestrator_events_endpoint: env_str("ORCHESTRATOR_EVENTS_ENDPOINT", "tcp://127.0.0.1:5561"),
+            health_pub_endpoint: env_str("HEALTH_PUB_ENDPOINT", "tcp://127.0.0.1:5562"),
+            circuit_breaker_pub_endpoint: env_str("CIRCUIT_BREAKER_PUB_ENDPOINT", "tcp://127.0.0.1:5563"),
         }
     }
 
@@ -269,6 +285,10 @@ mod tests {
             market_data_symbols: vec!["AAPL".to_string()],
             operation_mode: OperationMode::Paper,
             workload_config: WorkloadConfig::paper_trading(),
+            orchestrator_control_endpoint: "tcp://127.0.0.1:5560".to_string(),
+            orchestrator_events_endpoint: "tcp://127.0.0.1:5561".to_string(),
+            health_pub_endpoint: "tcp://127.0.0.1:5562".to_string(),
+            circuit_breaker_pub_endpoint: "tcp://127.0.0.1:5563".to_string(),
         };
 
         assert!(config.validate().is_ok());
@@ -301,6 +321,10 @@ mod tests {
             market_data_symbols: vec!["AAPL".to_string()],
             operation_mode: OperationMode::ReadOnly,
             workload_config: invalid_workload_config,
+            orchestrator_control_endpoint: "tcp://127.0.0.1:5560".to_string(),
+            orchestrator_events_endpoint: "tcp://127.0.0.1:5561".to_string(),
+            health_pub_endpoint: "tcp://127.0.0.1:5562".to_string(),
+            circuit_breaker_pub_endpoint: "tcp://127.0.0.1:5563".to_string(),
         };
 
         let result = config.validate();

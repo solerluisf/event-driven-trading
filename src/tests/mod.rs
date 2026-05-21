@@ -7,6 +7,9 @@
 // Use `cargo test -- --test-threads=1` or the provided `test-windows.bat`
 // script to run tests properly on Windows.
 
+pub mod correlation_tests;
+pub mod orchestration_tests;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -2220,5 +2223,3 @@ mod validation_tests {
 // Correlation ID Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[path = "correlation_tests.rs"]
-mod correlation_tests;

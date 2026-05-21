@@ -1,6 +1,11 @@
 pub mod bus_adapter;
+pub mod circuit_breaker_publisher;
+pub mod heartbeat_publisher;
+pub mod kill_switch_subscriber;
 pub mod messaging_adapter;
 pub mod market_data_publisher;
+pub mod mode_subscriber;
+pub mod orchestration_handler;
 pub mod order_lifecycle_publisher;
 pub mod priority_bus_adapter;
 pub mod wire_codec;
